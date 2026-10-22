@@ -144,6 +144,26 @@ function isUpload(request) {
 	);
 }
 
+/**
+ * The store tools that write (the shared tool set; dialect.write_tools): a move to the trash and back,
+ * the one permanent delete, and upsert. Nothing else the page sends changes the store but an upload.
+ */
+const WRITE_TOOLS = Object.freeze(['soft_delete', 'restore', 'delete', 'upsert']);
+
+/**
+ * Where a `chunks` answer (limit 1) says a document is: 'active' (it reads at least one chunk), 'trash'
+ * (IN_TRASH: every chunk is in the trash), 'gone' (NOT_FOUND: no chunk at all). Anything else is
+ * described, never taken for one of the three.
+ */
+function documentStateOf(answer) {
+	if (!answer || typeof answer !== 'object') return `no answer (${JSON.stringify(answer)})`;
+	if (answer.success === true)
+		return Array.isArray(answer.items) && answer.items.length > 0 ? 'active' : 'read no chunk';
+	if (answer.code === 'IN_TRASH') return 'trash';
+	if (answer.code === 'NOT_FOUND') return 'gone';
+	return `refused (${answer.code || answer.error || 'no code'})`;
+}
+
 /** Exact equality of two numeric arrays. */
 function sameVector(a, b) {
 	return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]);
@@ -434,6 +454,15 @@ function storeClient(base) {
 		}));
 		return client.sendFiles(items, token, 4);
 	}
+	/** Where the store keeps a document (documentStateOf): read with `chunks`, a refusal included. */
+	async function state(fixture, objectId) {
+		try {
+			return documentStateOf(await tool(fixture, 'chunks', { object_id: objectId, limit: 1 }));
+		} catch (e) {
+			if (e && (e.code === 'IN_TRASH' || e.code === 'NOT_FOUND')) return documentStateOf({ code: e.code });
+			return `not read (${String(e && e.message ? e.message : e).split('\n')[0]})`;
+		}
+	}
 	/** dialect.dimension of the fixture's managed store (null when it does not say). */
 	async function dimension(fixture) {
 		const answer = await tool(fixture, 'dialect');
@@ -442,7 +471,7 @@ function storeClient(base) {
 	async function close() {
 		if (sdk) await sdk.disconnect().catch(() => {});
 	}
-	return { server, runningTasks, tokenOf, tool, upload, dimension, close };
+	return { server, runningTasks, tokenOf, tool, state, upload, dimension, close };
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +637,37 @@ async function openConnection(page, fixture) {
 	await waitForStatsFigure(page, 'documents', 60000);
 }
 
+/** The visible Documents / Trash switch button of the directory in front: which is 'active' or 'trash'. */
+function directoryViewButton(page, which) {
+	return page
+		.getByRole('group', { name: CONSOLE.views })
+		.filter({ visible: true })
+		.first()
+		.getByRole('button', { name: which === 'trash' ? CONSOLE.trashView : CONSOLE.documentsView })
+		.first();
+}
+
+/** Bring the directory's Documents or Trash view to the front: click its switch, wait until it is pressed. */
+async function showDirectoryView(page, which, timeout = 10000) {
+	const toggle = directoryViewButton(page, which);
+	await toggle.click();
+	const deadline = Date.now() + timeout;
+	while (Date.now() < deadline) {
+		if ((await toggle.getAttribute('aria-pressed').catch(() => null)) === 'true') return;
+		await sleep(250);
+	}
+	throw new Error(`the ${which === 'trash' ? 'Trash' : 'Documents'} switch is not pressed after the click`);
+}
+
+/** The count on the visible Trash switch ("Trash (N)": stats.deleted_documents); null when it shows none. */
+async function trashCount(page) {
+	const label = await directoryViewButton(page, 'trash')
+		.innerText()
+		.catch(() => '');
+	const m = CONSOLE.trashView.exec(String(label || '').trim());
+	return m && m[1] ? Number(m[1].replace(/,/g, '')) : null;
+}
+
 module.exports = {
 	sleep,
 	createRecorder,
@@ -617,6 +677,8 @@ module.exports = {
 	toolOf,
 	nodeOf,
 	isUpload,
+	WRITE_TOOLS,
+	documentStateOf,
 	sameVector,
 	privacyViolations,
 	csvRecords,
@@ -642,4 +704,6 @@ module.exports = {
 	attrText,
 	textOf,
 	openConnection,
+	showDirectoryView,
+	trashCount,
 };

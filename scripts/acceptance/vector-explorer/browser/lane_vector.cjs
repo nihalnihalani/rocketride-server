@@ -26,9 +26,17 @@
  *     sends nothing (no upload request in the page's frames, the store
  *     unchanged); once on 127.0.0.1 and once on the LAN origin (LAN_URL)
  *   a chat answer carries at least one source; "open" lands on that chunk
- *   trash: Cancel is focused and sends nothing (no removal request in the
- *     page's frames, the store unchanged); Confirm removes exactly that
- *     document and the stats drop
+ *   trash: Cancel is focused and sends nothing (no write request in the
+ *     page's frames, the store unchanged); Move to trash asks for nothing
+ *     typed and moves exactly that document to the trash (one soft_delete;
+ *     the store reads it as in the trash, the other upload stays active),
+ *     the stats drop and the Trash switch counts one more
+ *   trash view: the Trash switch lists the store's trash; Restore brings
+ *     the document back at once (one restore; active again, the stats back
+ *     up); moved to the trash again, Delete permanently (Cancel focused; the
+ *     table name typed on a shared rocketride_vector table, nothing typed
+ *     elsewhere) deletes exactly that document (one delete; the store no
+ *     longer knows it, the other upload still active)
  *   the 1,500-document store loads to completion with the progress line,
  *     the first row unchanged at every look while it loads
  *   sign-out leaves no task token in the page's storage
@@ -89,16 +97,26 @@ const { base, out } = ARGS;
 const fixtureKey = ARGS.fixtures[0];
 const RUN = nodeCrypto.randomBytes(4).toString('hex');
 
-/** The writes among sent frames: removals ('remove_document', 'delete') and uploads ('upload'). */
+/**
+ * The writes among sent frames, in order: the write tools (C.WRITE_TOOLS: 'soft_delete', 'restore',
+ * 'delete', 'upsert') by name and uploads as 'upload'.
+ */
 function sentWrites(frames) {
 	const out = [];
 	for (const f of frames) {
 		if (f.dir !== 'sent' || !f.msg || f.msg.type !== 'request') continue;
 		const tool = C.toolOf(f.msg);
-		if (tool === 'remove_document' || tool === 'delete') out.push(tool);
+		if (C.WRITE_TOOLS.includes(tool)) out.push(tool);
 		else if (C.isUpload(f.msg)) out.push('upload');
 	}
 	return out;
+}
+
+/** The object_ids the page's `tool` calls asked for from frame `since` on, in order. */
+function askedIds(capture, tool, since) {
+	return C.exchanges(capture, tool, since).flatMap((x) =>
+		Array.isArray(x.input.object_ids) ? x.input.object_ids : []
+	);
 }
 
 /**
@@ -158,10 +176,8 @@ async function main() {
 	if (!fixture) throw new Error(`unknown fixture ${fixtureKey}; known: ${Object.keys(E.FIXTURES).join(', ')}`);
 	const { step, write } = C.createRecorder(fixtureKey, out, 'vector');
 	const store = C.storeClient(base);
-	const storeHas = async (name) => {
-		const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(name), limit: 1 });
-		return answer && answer.success === true;
-	};
+	// Where the store keeps one of the lane's documents: 'active', 'trash' or 'gone' (C.documentStateOf).
+	const stateOf = (name) => store.state(fixture, C.objectId(name));
 	const work = fs.mkdtempSync(path.join(os.tmpdir(), 'vx-lane-'));
 	const browser = await chromium.launch({ channel: 'chrome', headless: true });
 	const context = await browser.newContext({ viewport: { width: 1440, height: 920 } });
@@ -222,7 +238,8 @@ async function main() {
 			const rows = await C.waitForUploads(page, [own.single], 120000);
 			if (!C.uploadsDone(rows, [own.single]))
 				return `the upload row did not finish as done: ${JSON.stringify(rows.slice(-3))}`;
-			if (!(await storeHas(own.single))) return 'the store does not have the uploaded document';
+			const stored = await stateOf(own.single);
+			if (stored !== 'active') return `the store does not have the uploaded document (it is ${stored})`;
 			await C.waitForStatsFigure(page, 'documents', 30000, before + 1).catch(() => {});
 			return (await statsDocuments()) === before + 1
 				? true
@@ -241,7 +258,8 @@ async function main() {
 					`the nested file's row did not finish as done: ` +
 					`${JSON.stringify(rows.filter((r) => r.path.endsWith('note.md')))}`
 				);
-			if (!(await storeHas(own.nested))) return `the store has no document named ${own.nested}`;
+			const nested = await stateOf(own.nested);
+			if (nested !== 'active') return `the store has no document named ${own.nested} (it is ${nested})`;
 			return (await C.bodyText(page)).includes('deeper') ? true : 'the directory does not show the nested folder';
 		});
 
@@ -340,49 +358,151 @@ async function main() {
 			return landed === true ? true : `no chunk #${target[2]} of ${target[1]} is shown after open`;
 		});
 
+		// The directory's own controls: a row's button by its exact name and the dialog in front.
+		const rowButton = (name) => page.getByRole('button', { name, exact: true }).filter({ visible: true }).first();
+		const dialog = page.getByRole('dialog').filter({ visible: true }).first();
+		const dialogButton = (name) => dialog.getByRole('button', { name }).first();
+		const showView = (which) => C.showDirectoryView(page, which);
+		const trashCount = () => C.trashCount(page);
+		// The directory renders only the rows in view: filter it to one document so its row is there.
+		const filterTo = async (name) => {
+			await page.getByPlaceholder(UI.filterPaths).filter({ visible: true }).first().fill(name);
+			await page.waitForTimeout(500);
+		};
+
 		await step(
 			page,
-			'trash: Cancel focused and sending nothing, Confirm removes exactly that document',
+			'trash: Cancel focused and sending nothing, Move to trash moves exactly that document to the trash',
 			async (note) => {
 				// The chat step's "open" left a document tab in front: back to this connection's console.
 				await C.openConnection(page, fixture);
 				const shown = await statsDocuments();
-				// The directory renders only the rows in view: filter it to the lane's document so its row is there.
-				await page.getByPlaceholder(UI.filterPaths).filter({ visible: true }).first().fill(own.single);
-				const trash = page
-					.getByRole('button', { name: UI.trash(own.single) })
-					.filter({ visible: true })
-					.first();
+				const trashBefore = await trashCount();
+				await filterTo(own.single);
+				const trash = rowButton(UI.trash(own.single));
+				const confirm = dialogButton(UI.trashConfirm);
 				const since = capture.frames.length;
 				await trash.click();
-				await page.getByRole('button', { name: UI.removeConfirm }).first().waitFor({ timeout: 15000 });
+				await confirm.waitFor({ timeout: 15000 });
 				const focused = (await C.focusedText(page)).trim();
 				if (focused !== UI.cancel) return `focus is on ${JSON.stringify(focused)}, not Cancel`;
-				await page.getByRole('button', { name: UI.cancel }).first().click();
+				await dialogButton(UI.cancel).click();
 				await page.waitForTimeout(1000);
 				if (capture.sockets === 0) return 'the page opened no WebSocket';
-				const sent = sentWrites(capture.frames.slice(since));
-				if (sent.length) return `the page sent ${sent.join(', ')} although Cancel was chosen`;
-				if (!(await storeHas(own.single))) return 'Cancel removed the document';
+				const cancelled = sentWrites(capture.frames.slice(since));
+				if (cancelled.length) return `the page sent ${cancelled.join(', ')} although Cancel was chosen`;
+				const kept = await stateOf(own.single);
+				if (kept !== 'active') return `after Cancel the document is ${kept}`;
+				const sinceConfirm = capture.frames.length;
 				await trash.click();
-				const confirm = page.getByRole('button', { name: UI.removeConfirm }).first();
 				await confirm.waitFor({ timeout: 15000 });
-				// A shared rocketride_vector table asks for its name typed first; Remove stays disabled until then.
-				const typed = UI.typedConfirm.exec(await C.bodyText(page));
+				// A move to the trash can be undone: nothing to type, a shared rocketride_vector table included.
+				if (await dialog.getByRole('textbox').count()) return 'the move to the trash asks for something typed';
+				if (await confirm.isDisabled()) return 'Move to trash is disabled';
+				await confirm.click();
+				await C.waitForExchange(capture, 'soft_delete', { since: sinceConfirm, timeout: 60000 });
+				await page.waitForTimeout(1500);
+				const sent = sentWrites(capture.frames.slice(sinceConfirm));
+				const asked = askedIds(capture, 'soft_delete', sinceConfirm);
+				const single = await stateOf(own.single);
+				const nested = await stateOf(own.nested);
+				note({ sent, asked, single, nested, trashBefore });
+				if (JSON.stringify(sent) !== JSON.stringify(['soft_delete']))
+					return `Move to trash sent ${JSON.stringify(sent)}, not one soft_delete`;
+				if (JSON.stringify(asked) !== JSON.stringify([C.objectId(own.single)]))
+					return `soft_delete asked for ${JSON.stringify(asked)}, not the document's own objectId`;
+				if (single !== 'trash') return `after Move to trash the document is ${single}, not in the trash`;
+				if (nested !== 'active') return `Move to trash touched another document (it is ${nested})`;
+				if (shown !== null) await C.waitForStatsFigure(page, 'documents', 30000, shown - 1).catch(() => {});
+				const after = await statsDocuments();
+				if (shown === null || after !== shown - 1) return `stats ${shown} -> ${after}`;
+				// "Trash (N)" is the store's count; a store that gives none shows plain "Trash" before and after.
+				const trashAfter = await trashCount();
+				note({ trashAfter });
+				return trashBefore === null || trashAfter === trashBefore + 1
+					? true
+					: `the Trash switch counts ${trashAfter}, ${trashBefore} before`;
+			}
+		);
+
+		await step(
+			page,
+			'trash view: Restore brings the document back; Delete permanently, typed on a shared table, deletes it',
+			async (note) => {
+				const id = C.objectId(own.single);
+				const start = await stateOf(own.single);
+				if (start !== 'trash') return `the document is ${start} before the Trash view, not in the trash`;
+				const shown = await statsDocuments();
+				let since = capture.frames.length;
+				await showView('trash');
+				// The Trash view lists the store's trash.
+				const listing = await C.waitForExchange(capture, 'list_documents', {
+					since,
+					timeout: 30000,
+					where: (x) => x.input.deleted === 'deleted',
+				});
+				await filterTo(own.single);
+				since = capture.frames.length;
+				await rowButton(UI.restore(own.single)).click();
+				await C.waitForExchange(capture, 'restore', { since, timeout: 60000 });
+				await page.waitForTimeout(1500);
+				const restoreSent = sentWrites(capture.frames.slice(since));
+				const restored = askedIds(capture, 'restore', since);
+				const back = await stateOf(own.single);
+				note({ listing: listing.input, restoreSent, restored, back });
+				if (JSON.stringify(restoreSent) !== JSON.stringify(['restore']))
+					return `Restore sent ${JSON.stringify(restoreSent)}, not one restore`;
+				if (JSON.stringify(restored) !== JSON.stringify([id]))
+					return `restore asked for ${JSON.stringify(restored)}, not the document's own objectId`;
+				if (back !== 'active') return `after Restore the document is ${back}`;
+				if (shown !== null) await C.waitForStatsFigure(page, 'documents', 30000, shown + 1).catch(() => {});
+				const restoredStats = await statsDocuments();
+				if (shown === null || restoredStats !== shown + 1)
+					return `after Restore the stats show ${restoredStats}, ${shown} before`;
+				// To the trash again, then delete it permanently from the Trash view.
+				await showView('active');
+				await filterTo(own.single);
+				since = capture.frames.length;
+				await rowButton(UI.trash(own.single)).click();
+				await dialogButton(UI.trashConfirm).click();
+				await C.waitForExchange(capture, 'soft_delete', { since, timeout: 60000 });
+				await page.waitForTimeout(1000);
+				const again = await stateOf(own.single);
+				if (again !== 'trash') return `moved to the trash again, the document is ${again}`;
+				await showView('trash');
+				await filterTo(own.single);
+				since = capture.frames.length;
+				await rowButton(UI.deletePermanently(own.single)).click();
+				const confirm = dialogButton(UI.deleteConfirm);
+				await confirm.waitFor({ timeout: 15000 });
+				const focused = (await C.focusedText(page)).trim();
+				if (focused !== UI.cancel) return `focus is on ${JSON.stringify(focused)}, not Cancel`;
+				// A shared rocketride_vector table asks for its name typed first; the delete stays disabled until then.
+				const typed = UI.typedConfirm.exec(await C.textOf(dialog));
 				note({ typed: typed ? typed[1] : null });
 				if (fixtureKey === 'rocketride_vector' && !typed)
 					return 'the shared table asked for no typed table name';
 				if (typed) {
-					if (!(await confirm.isDisabled())) return 'Remove is enabled before the table name is typed';
-					await page.getByRole('textbox', { name: UI.typedConfirm }).first().fill(typed[1]);
+					if (!(await confirm.isDisabled()))
+						return 'Delete permanently is enabled before the table name is typed';
+					await dialog.getByRole('textbox', { name: UI.typedConfirm }).first().fill(typed[1]);
+				} else if (await dialog.getByRole('textbox').count()) {
+					return 'deleting one document of a store that is not shared asks for something typed';
 				}
 				await confirm.click();
-				await page.waitForTimeout(2000);
-				if (await storeHas(own.single)) return 'Confirm did not remove the document';
-				if (!(await storeHas(own.nested))) return 'Confirm removed another document';
-				if (shown !== null) await C.waitForStatsFigure(page, 'documents', 30000, shown - 1).catch(() => {});
-				const after = await statsDocuments();
-				return shown !== null && after === shown - 1 ? true : `stats ${shown} -> ${after}`;
+				await C.waitForExchange(capture, 'delete', { since, timeout: 60000 });
+				await page.waitForTimeout(1500);
+				const deleteSent = sentWrites(capture.frames.slice(since));
+				const deleted = askedIds(capture, 'delete', since);
+				const gone = await stateOf(own.single);
+				const nested = await stateOf(own.nested);
+				note({ deleteSent, deleted, gone, nested });
+				if (JSON.stringify(deleteSent) !== JSON.stringify(['delete']))
+					return `Delete permanently sent ${JSON.stringify(deleteSent)}, not one delete`;
+				if (JSON.stringify(deleted) !== JSON.stringify([id]))
+					return `delete asked for ${JSON.stringify(deleted)}, not the document's own objectId`;
+				if (gone !== 'gone') return `after Delete permanently the document is ${gone}`;
+				return nested === 'active' ? true : `Delete permanently touched another document (it is ${nested})`;
 			}
 		);
 
@@ -432,7 +552,7 @@ async function main() {
 			const ids = Object.values(own)
 				.filter((n) => /\.(md|pdf)$/.test(n))
 				.map(C.objectId);
-			await store.tool(fixture, 'remove_document', { object_ids: ids });
+			await store.tool(fixture, 'delete', { object_ids: ids });
 		} catch {
 			// best effort
 		}

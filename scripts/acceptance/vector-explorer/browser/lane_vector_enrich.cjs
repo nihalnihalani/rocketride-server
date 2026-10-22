@@ -85,16 +85,23 @@
  *     on a settled map: its unscoped sample before Show A and B, and both
  *     stars, on that same sample, once it has settled after); the chat column
  *     is 55 % before and after the Search toggle
- *   duplicates removal: Remove all queued, Cancel sends nothing, Confirm with
- *     the typed count removes exactly the queued documents and the stats drop
- *   outlier removal: Remove document, confirmed, the OCR junk is gone
+ *   duplicates to the trash: Move all queued to the trash, Cancel sends no
+ *     write, Confirm (nothing to type: a move to the trash can be undone)
+ *     moves exactly the queued documents to the trash (soft_delete, batches
+ *     of at most 100, no permanent delete); the store reads each as in the
+ *     trash, the active stats drop and the trash count grows by them
+ *   outlier to the trash: Move to trash, confirmed, moves the OCR junk to the
+ *     trash (the same checks)
  *   ingest summary (P1-9): a 3-file drop says '3 added (N chunks)'; Show new
  *     chunks pins at most 200 of them
  *   health (P1-7, postgres): the legacy card lists the chunk-0-less document
  *     and the document with one deleted chunk
- *   restore: the removed demo documents are back, the lane's own gone (the
- *     ones the store holds removed on the page; whatever the page left is
- *     then removed through the store, so the next run starts clean)
+ *   restore: the trashed demo documents come back through the Trash view's
+ *     Restore (active again, the stats back up, the trash count down); the
+ *     lane's own uploads go to the trash and are deleted permanently from
+ *     the Trash view (no other document ever goes to a permanent delete);
+ *     whatever the page left is then put right through the store (restore,
+ *     else the corpus uploaded again; delete), so the next run starts clean
  *   sign-out: saved views and saved filters are gone after signing in again
  *   privacy (B4): over every frame (similarity_matrix rows exempt only at
  *     their own n) and every downloaded file
@@ -236,13 +243,13 @@ const UI = {
 		shortestPath: 'shortest-path',
 		keep: (p) => `Keep ${p}`,
 		showGroup: /^Show group$/,
-		removeAll: /^Remove all queued \(/,
+		trashAll: /^Move all queued to the trash \(/,
 	},
 	outliers: {
 		section: '[data-component="OutliersPanel"]',
 		percentile: 'Which share of the sample to review, by lowest density',
 		why: /density [\d.]+ vs (?:the )?sample median [\d.]+/,
-		remove: /^Remove document$/,
+		trash: /^Move to trash$/,
 	},
 	inspector: {
 		addPositive: 'Add as a positive example for Recommend',
@@ -1091,26 +1098,106 @@ function dedupeVerdict({
 	return samplesSent === 0 ? true : `moving the slider sent ${samplesSent} sample requests`;
 }
 
-/** Removal: exactly the expected documents were removed (in batches of at most 100) and the stats dropped by them. */
-function removalVerdict({ expected, sent, before, after, chunks }) {
-	const asked = (sent || []).flatMap((s) =>
-		Array.isArray(s.object_ids) ? s.object_ids : s.object_id ? [s.object_id] : []
-	);
+/** The distinct object_ids a list of write inputs asked for, sorted. */
+function idsAsked(sent) {
+	return [...new Set((sent || []).flatMap((s) => (Array.isArray(s.object_ids) ? s.object_ids : [])))].sort();
+}
+
+/**
+ * Move to the trash: exactly the expected documents went to soft_delete (in batches of at most 100) and
+ * no permanent delete went out; the store reads each of them as in the trash, the active stats dropped
+ * by them and the trash count (where the store counts it) grew by them.
+ */
+function trashVerdict({ expected, sent, deleted, before, after, chunks, states }) {
 	if ((sent || []).some((s) => Array.isArray(s.object_ids) && s.object_ids.length > 100))
-		return 'a removal batch held more than 100 documents';
+		return 'a move-to-trash batch held more than 100 documents';
+	if (deleted) return `the page sent ${deleted} permanent delete requests for a move to the trash`;
 	const want = [...new Set(expected)].sort();
-	const got = [...new Set(asked)].sort();
+	const got = idsAsked(sent);
 	if (JSON.stringify(want) !== JSON.stringify(got))
-		return `removed ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`;
+		return `moved ${JSON.stringify(got)} to the trash, expected ${JSON.stringify(want)}`;
+	const notTrashed = want.filter((id) => !states || states[id] !== 'trash');
+	if (notTrashed.length)
+		return `the store reads ${notTrashed[0]} as ${states ? states[notTrashed[0]] : 'nothing'}, not in the trash`;
 	if (!before || !after) return 'the store was not read before and after';
 	if (after.documents !== before.documents - want.length)
 		return (
-			`the store holds ${after.documents} documents after, ${before.documents} before ` +
-			`(${want.length} removed)`
+			`the store holds ${after.documents} active documents after, ${before.documents} before ` +
+			`(${want.length} moved to the trash)`
 		);
 	if (Number.isInteger(chunks) && after.chunks !== before.chunks - chunks)
-		return `the store holds ${after.chunks} chunks after, ${before.chunks} before (${chunks} removed)`;
+		return `the store holds ${after.chunks} active chunks after, ${before.chunks} before (${chunks} moved)`;
+	if (
+		Number.isInteger(before.deleted_documents) &&
+		after.deleted_documents !== before.deleted_documents + want.length
+	)
+		return (
+			`the trash holds ${after.deleted_documents} documents after, ${before.deleted_documents} before ` +
+			`(${want.length} moved to it)`
+		);
 	return true;
+}
+
+/**
+ * Restore: the trashed demo documents went back through the Trash view's Restore (exactly those, none
+ * refused), the store reads each as active again, the active stats grew and the trash count (where the
+ * store counts it) shrank by them; the lane's own uploads the store held were deleted permanently from
+ * the Trash view (exactly those, none refused), no other document ever went to a permanent delete, and
+ * the store no longer knows any of the lane's uploads.
+ */
+function restoreVerdict({
+	trashed,
+	restoreSent,
+	refusedRestore,
+	back,
+	before,
+	after,
+	own,
+	stored,
+	deleteSent,
+	refusedDelete,
+	ownStates,
+}) {
+	const want = [...new Set(trashed || [])].sort();
+	if (!want.length)
+		return 'no demo document was moved to the trash (the trash steps did not run), so nothing was restored';
+	if (!(own || []).length)
+		return 'the lane uploaded nothing (the ingest summary step did not run), so nothing was deleted';
+	const restored = idsAsked(restoreSent);
+	if (JSON.stringify(restored) !== JSON.stringify(want))
+		return `restored ${JSON.stringify(restored)}, expected ${JSON.stringify(want)}`;
+	if ((refusedRestore || []).length)
+		return `the page did not restore ${refusedRestore[0]} (restored through the store instead)`;
+	const notBack = want.filter((id) => !back || back[id] !== 'active');
+	if (notBack.length)
+		return `after Restore the store reads ${notBack[0]} as ${back ? back[notBack[0]] : 'nothing'}, not active`;
+	if (!before || !after) return 'the store was not read before and after the restores';
+	if (after.documents !== before.documents + want.length)
+		return (
+			`the store holds ${after.documents} active documents after the restores, ${before.documents} before ` +
+			`(${want.length} restored)`
+		);
+	if (
+		Number.isInteger(before.deleted_documents) &&
+		after.deleted_documents !== before.deleted_documents - want.length
+	)
+		return (
+			`the trash holds ${after.deleted_documents} documents after the restores, ` +
+			`${before.deleted_documents} before (${want.length} restored)`
+		);
+	const deleted = idsAsked(deleteSent);
+	const foreign = deleted.filter((id) => !own.includes(id));
+	if (foreign.length) return `a permanent delete asked for ${foreign[0]}, not one of the lane's own uploads`;
+	const held = [...new Set(stored || [])].sort();
+	if (JSON.stringify(deleted) !== JSON.stringify(held))
+		return `deleted ${JSON.stringify(deleted)} permanently, expected the stored uploads ${JSON.stringify(held)}`;
+	if ((refusedDelete || []).length)
+		return `the page did not delete ${refusedDelete[0]} permanently (deleted through the store instead)`;
+	const left = own.filter((id) => !ownStates || ownStates[id] !== 'gone');
+	return left.length
+		? `after Delete permanently the store reads the lane's upload ${left[0]} as ` +
+				`${ownStates ? ownStates[left[0]] : 'nothing'} (deleted through the store instead)`
+		: true;
 }
 
 /**
@@ -1151,11 +1238,11 @@ function chartsVerdict({ topBin, documents, directory, chip }) {
 
 /**
  * The scope step's verdict: the directory, the sample and the chat stay inside the folder; the
- * status says who filtered (the documents answer's filter_applied); the saved filter applies again.
+ * status says who filtered (the list_documents answer's filter_applied); the saved filter applies again.
  */
 function scopeVerdict({ prefix, listing, status, directory, sampleInput, sample, scopeIds, sources, reapplied }) {
 	if (!listing || listing.success !== true)
-		return `the scoped documents call answered ${JSON.stringify(listing).slice(0, 160)}`;
+		return `the scoped list_documents call answered ${JSON.stringify(listing).slice(0, 160)}`;
 	const applied = listing.filter_applied;
 	if (
 		applied === 'server'
@@ -1484,14 +1571,16 @@ const STEP_TITLES = {
 		'Copy as node setting copies the value',
 	compare: 'search: Compare reports the shared results and the map draws both stars',
 	layout: 'search: the chat column is 55 % before and after the Search toggle',
-	'dedupe removal':
-		'duplicates removal: Remove all queued, Cancel sends nothing, ' +
-		'Confirm with the typed count removes exactly the queued documents',
-	'outlier removal': 'outlier removal: Remove document, confirmed, removes the OCR junk',
+	'dedupe trash':
+		'duplicates to the trash: Move all queued to the trash, Cancel sends nothing, ' +
+		'Confirm (nothing to type) moves exactly the queued documents to the trash',
+	'outlier trash': 'outlier to the trash: Move to trash, confirmed, moves the OCR junk to the trash',
 	'ingest summary':
 		"ingest summary (P1-9): a 3-file drop says '3 added (N chunks)'; Show new chunks pins at most 200",
 	health: 'health (P1-7): the legacy card lists the chunk-0-less document and the document with one deleted chunk',
-	restore: "restore: the removed demo documents are back under their own names and the lane's own uploads are gone",
+	restore:
+		'restore: the trashed demo documents come back from the Trash under their own names ' +
+		"and the lane's own uploads are deleted permanently",
 	'sign-out': 'sign-out: saved views and saved filters are gone after signing in again',
 	privacy: 'privacy (B4): no full-dimension vector outside vectors and embed answers, none in a download',
 };
@@ -1524,8 +1613,8 @@ function stepsFor(fixtureKey) {
 		'threshold',
 		'compare',
 		'layout',
-		'dedupe removal',
-		'outlier removal',
+		'dedupe trash',
+		'outlier trash',
 		'ingest summary',
 		'restore',
 		'sign-out',
@@ -1669,7 +1758,8 @@ async function drive(fixtureKey, base, out, planned, step) {
 	page.setDefaultTimeout(30000);
 	const capture = C.captureFrames(page);
 	const downloads = [];
-	const removedDemo = new Set();
+	// The demo documents the trash steps moved to the trash (the restore step brings them back).
+	const trashedDemo = new Set();
 	const ownUploads = [];
 	const map = page.locator(MAP.root).filter({ visible: true }).first();
 	const canvas = map.locator(MAP.canvas).first();
@@ -1916,26 +2006,36 @@ async function drive(fixtureKey, base, out, planned, step) {
 			throw new Error(`the export entry ${id} is off: ${(await C.textOf(entry)).slice(0, 120)}`);
 		return download(() => visible(page.locator(UI.export.format(id, format))).click());
 	};
-	/** Confirm (or cancel) the removal dialog in front, typing what it asks for. */
-	const answerRemoval = async (confirm, typedCount) => {
+	/**
+	 * Confirm (or cancel) the move-to-trash or permanent-delete dialog in front. A move to the trash
+	 * (action 'trash') can be undone and asks for nothing typed: a typed field there throws. A permanent
+	 * delete (action 'delete') types what it asks for: a shared table's name, else `typedCount`.
+	 */
+	const answerRemoval = async (confirm, { action = 'trash', typedCount = null } = {}) => {
 		const dialog = visible(page.getByRole('dialog'));
 		await dialog.waitFor({ timeout: 15000 });
 		if (!confirm) return button(/^Cancel$/, dialog).click();
-		const prompt = await C.textOf(dialog);
-		const table = CONSOLE.typedConfirm.exec(prompt);
 		const typedBox = visible(dialog.getByRole('textbox'));
-		if (await typedBox.isVisible().catch(() => false)) await typedBox.fill(table ? table[1] : String(typedCount));
-		return button(/^Remove/, dialog).click();
+		const asksTyped = await typedBox.isVisible().catch(() => false);
+		if (action === 'trash') {
+			if (asksTyped) throw new Error('the move to the trash asks for something typed');
+			return button(CONSOLE.trashConfirm, dialog).click();
+		}
+		const table = CONSOLE.typedConfirm.exec(await C.textOf(dialog));
+		if (asksTyped) await typedBox.fill(table ? table[1] : String(typedCount));
+		return button(CONSOLE.deleteConfirm, dialog).click();
 	};
 	const stats = async () => {
 		const s = await store.tool(fixture, 'stats', { mode: 'full' });
-		return s && s.success === true ? { documents: s.documents, chunks: s.chunks } : null;
+		return s && s.success === true
+			? { documents: s.documents, chunks: s.chunks, deleted_documents: s.deleted_documents }
+			: null;
 	};
-	/** Every documents item the page received since frame `since`. */
+	/** Every item of the active listings (list_documents, the Documents view) the page received since frame `since`. */
 	const documentItems = (since = 0) =>
-		C.exchanges(capture, 'documents', since).flatMap((x) =>
-			x.result && Array.isArray(x.result.items) ? x.result.items : []
-		);
+		C.exchanges(capture, 'list_documents', since)
+			.filter((x) => (x.input.deleted || 'active') === 'active')
+			.flatMap((x) => (x.result && Array.isArray(x.result.items) ? x.result.items : []));
 	/** Scroll the directory in front to its top or bottom (its rows are drawn for the window only). */
 	const scrollDirectory = (where) =>
 		page.evaluate((to) => {
@@ -1947,7 +2047,8 @@ async function drive(fixtureKey, base, out, planned, step) {
 			if (box) box.scrollTop = to === 'bottom' ? box.scrollHeight : 0;
 		}, where);
 	/**
-	 * The directory rows drawn in front: { objectId, path (from the page's documents answers), flags (badge words) }.
+	 * The directory rows drawn in front: { objectId, path (from the page's list_documents answers),
+	 * flags (badge words) }.
 	 */
 	const directoryRows = async () => {
 		const rows = await page.evaluate(() =>
@@ -2007,7 +2108,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 			queuedCount: count(String((await C.attrText(section, 'data-queued')) ?? '')),
 		};
 	};
-	/** Add a Folder is under condition; the documents answer the directory asked for with it. */
+	/** Add a Folder is under condition; the list_documents answer the directory asked for with it. */
 	const scopeToFolder = async (prefix) => {
 		const since = capture.frames.length;
 		await button(UI.scope.add).click();
@@ -2016,7 +2117,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 		await visible(editor.getByLabel(UI.scope.prefix, { exact: true })).fill(prefix);
 		await button(UI.scope.addButton, editor).click();
 		await visible(page.getByRole('button', { name: UI.scope.chip(prefix) })).waitFor({ timeout: 15000 });
-		const listing = await C.waitForExchange(capture, 'documents', {
+		const listing = await C.waitForExchange(capture, 'list_documents', {
 			since,
 			timeout: 60000,
 			where: (x) => x.input.filter && x.input.filter.path_prefix === prefix,
@@ -2514,7 +2615,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 			await section.waitFor({ timeout: 15000 });
 			await combo(UI.dedupe.policy, section).selectOption(UI.dedupe.shortestPath);
 			const { groups, keptPaths, queuedPaths, queuedCount } = await readQueue(section);
-			// What Remove all queued must remove: the documents the panel queued.
+			// What Move all queued to the trash must move: the documents the panel queued.
 			queued = queuedPaths.map((p) => ({ path: p, objectId: C.objectId(p) }));
 			const slider = visible(section.getByRole('slider', { name: UI.dedupe.threshold }));
 			const setSlider = (value) =>
@@ -2938,7 +3039,7 @@ async function drive(fixtureKey, base, out, planned, step) {
 		// Writes: the duplicates queue, an outlier, a 3-file drop
 		// ------------------------------------------------------------------
 
-		await step(page, STEP_TITLES['dedupe removal'], async (note) => {
+		await step(page, STEP_TITLES['dedupe trash'], async (note) => {
 			if (!queued.length) return 'nothing queued (duplicates queue step)';
 			await C.switchView(page, CONSOLE.mapTab);
 			await sideTab(UI.map.tabs.duplicates);
@@ -2960,31 +3061,42 @@ async function drive(fixtureKey, base, out, planned, step) {
 				chunksOf[q.objectId] = item ? item.chunks : null;
 			}
 			let since = capture.frames.length;
-			await button(UI.dedupe.removeAll, section).click();
+			await button(UI.dedupe.trashAll, section).click();
 			await answerRemoval(false);
 			await C.sleep(1500);
-			const cancelled = C.requestsSince(capture, since, (m) => C.toolOf(m) === 'remove_document').length;
-			if (cancelled) return `Cancel sent ${cancelled} removal requests`;
+			const cancelled = C.requestsSince(capture, since, (m) => C.WRITE_TOOLS.includes(C.toolOf(m))).length;
+			if (cancelled) return `Cancel sent ${cancelled} write requests`;
 			since = capture.frames.length;
-			await button(UI.dedupe.removeAll, section).click();
-			await answerRemoval(true, queued.length);
+			await button(UI.dedupe.trashAll, section).click();
+			await answerRemoval(true);
+			queued.forEach((q) => trashedDemo.add(q.path));
 			await poll(
-				async () => C.exchanges(capture, 'remove_document', since).filter((x) => x.response).length,
+				async () => C.exchanges(capture, 'soft_delete', since).filter((x) => x.response).length,
 				(v) => v >= 1,
 				60000
 			);
 			await C.sleep(2000);
-			const sent = C.exchanges(capture, 'remove_document', since).map((x) => x.input);
+			const sent = C.exchanges(capture, 'soft_delete', since).map((x) => x.input);
+			const deleted = C.requestsSince(capture, since, (m) => C.toolOf(m) === 'delete').length;
 			const after = await stats();
+			const states = {};
+			for (const q of queued) states[q.objectId] = await store.state(fixture, q.objectId);
 			const chunks = Object.values(chunksOf).every(Number.isInteger)
 				? Object.values(chunksOf).reduce((a, b) => a + b, 0)
 				: null;
-			queued.forEach((q) => removedDemo.add(q.path));
-			note({ queued: queued.map((q) => q.path), sent, before, after, chunks });
-			return removalVerdict({ expected: queued.map((q) => q.objectId), sent, before, after, chunks });
+			note({ queued: queued.map((q) => q.path), sent, deleted, before, after, chunks, states });
+			return trashVerdict({
+				expected: queued.map((q) => q.objectId),
+				sent,
+				deleted,
+				before,
+				after,
+				chunks,
+				states,
+			});
 		});
 
-		await step(page, STEP_TITLES['outlier removal'], async (note) => {
+		await step(page, STEP_TITLES['outlier trash'], async (note) => {
 			if (!sample) return 'no sample';
 			await sideTab(MAP.tabs.outliers);
 			const list = visible(map.getByRole('list', { name: MAP.outliersList }));
@@ -2992,24 +3104,26 @@ async function drive(fixtureKey, base, out, planned, step) {
 			const before = await stats();
 			const since = capture.frames.length;
 			await button(
-				UI.outliers.remove,
+				UI.outliers.trash,
 				list
 					.locator('li')
 					.filter({ hasText: E.DEMO_CORPUS.outlier.split('/').pop() })
 					.first()
 			).click();
-			await answerRemoval(true, 1);
+			await answerRemoval(true);
+			trashedDemo.add(ocr);
 			await poll(
-				async () => C.exchanges(capture, 'remove_document', since).filter((x) => x.response).length,
+				async () => C.exchanges(capture, 'soft_delete', since).filter((x) => x.response).length,
 				(v) => v >= 1,
 				60000
 			);
 			await C.sleep(1500);
-			const sent = C.exchanges(capture, 'remove_document', since).map((x) => x.input);
+			const sent = C.exchanges(capture, 'soft_delete', since).map((x) => x.input);
+			const deleted = C.requestsSince(capture, since, (m) => C.toolOf(m) === 'delete').length;
 			const after = await stats();
-			removedDemo.add(ocr);
-			note({ sent, before, after });
-			return removalVerdict({ expected: [C.objectId(ocr)], sent, before, after, chunks: null });
+			const states = { [C.objectId(ocr)]: await store.state(fixture, C.objectId(ocr)) };
+			note({ sent, deleted, before, after, states });
+			return trashVerdict({ expected: [C.objectId(ocr)], sent, deleted, before, after, chunks: null, states });
 		});
 
 		await step(page, STEP_TITLES['ingest summary'], async (note) => {
@@ -3069,70 +3183,134 @@ async function drive(fixtureKey, base, out, planned, step) {
 		}
 
 		await step(page, STEP_TITLES['restore'], async (note) => {
-			const corpus = demoCorpus();
-			const again = [...removedDemo]
-				.map((p) => ({ name: p, text: corpus[p.slice(E.DEMO_PREFIX.length)] }))
-				.filter((f) => typeof f.text === 'string');
-			if (again.length) await store.upload(fixture, again);
+			const errText = (e) => String(e && e.message ? e.message : e).split('\n')[0];
+			const trashed = [...trashedDemo];
 			await C.openConnection(page, fixture);
 			await openConsole();
-			// The directory draws the rows in view only: filter it down to the lane's own uploads first.
+			// The directory draws the rows in view only: filter it down to one document at a time.
 			const box = visible(page.getByRole('searchbox', { name: 'Filter documents by path' }));
-			await box.fill(`enrich-${run}`);
-			await C.sleep(1000);
-			const holds = async (name) => {
-				const answer = await store.tool(fixture, 'chunks', { object_id: C.objectId(name), limit: 1 });
-				return !!(answer && Array.isArray(answer.items) && answer.items.length);
+			const rowButton = (name) => visible(page.getByRole('button', { name, exact: true }));
+			const showOne = async (p) => {
+				await box.fill(p);
+				await C.sleep(800);
 			};
-			// Only an upload the store holds has a row to remove (a file the drop did not add has none);
-			// one removal that fails does not keep the others from being tried.
-			const stored = [];
-			for (const p of ownUploads) if (await holds(p)) stored.push(p);
-			const refused = [];
-			for (const p of stored) {
+			// The trashed demo documents come back from the Trash view, one row at a time (Restore asks nothing);
+			// one that fails does not keep the others from being tried.
+			const before = await stats();
+			const sinceRestore = capture.frames.length;
+			const refusedRestore = [];
+			if (trashed.length) await C.showDirectoryView(page, 'trash');
+			for (const p of trashed) {
 				try {
-					await button(CONSOLE.trash(p)).click();
-					await answerRemoval(true, 1);
-					await C.sleep(1500);
+					await showOne(p);
+					const at = capture.frames.length;
+					await rowButton(CONSOLE.restore(p)).click();
+					await C.waitForExchange(capture, 'restore', { since: at, timeout: 60000 });
 				} catch (e) {
-					refused.push(`${p}: ${String(e && e.message ? e.message : e).split('\n')[0]}`);
+					refusedRestore.push(`${p}: ${errText(e)}`);
 				}
 			}
-			await box.fill('');
-			const back = [];
-			for (const f of again) back.push(await holds(f.name));
-			const gone = [];
-			for (const p of ownUploads) gone.push(!(await holds(p)));
-			// What the page left behind goes through the store, so the next run starts from the corpus
-			// as it was (the verdict is the page's).
-			const left = ownUploads.filter((_, i) => !gone[i]);
-			const cleaned = left.length
-				? await store
-						.tool(fixture, 'remove_document', { object_ids: left.map((p) => C.objectId(p)) })
-						.catch((e) => ({ error: String(e && e.message ? e.message : e) }))
-				: null;
+			await C.sleep(1500);
+			const restoreSent = C.exchanges(capture, 'restore', sinceRestore).map((x) => x.input);
+			const back = {};
+			for (const p of trashed) back[C.objectId(p)] = await store.state(fixture, C.objectId(p));
+			const after = await stats();
+			// The lane's own uploads the store holds: to the trash from the Documents view, then deleted
+			// permanently from the Trash view (typed on a shared table).
+			const stored = [];
+			for (const p of ownUploads) if ((await store.state(fixture, C.objectId(p))) === 'active') stored.push(p);
+			const refusedDelete = [];
+			const refused = (p) => refusedDelete.some((r) => r.startsWith(`${p}: `));
+			if (stored.length) await C.showDirectoryView(page, 'active');
+			for (const p of stored) {
+				try {
+					await showOne(p);
+					const at = capture.frames.length;
+					await rowButton(CONSOLE.trash(p)).click();
+					await answerRemoval(true);
+					await C.waitForExchange(capture, 'soft_delete', { since: at, timeout: 60000 });
+				} catch (e) {
+					refusedDelete.push(`${p}: ${errText(e)} (moving it to the trash)`);
+				}
+			}
+			if (stored.length) await C.showDirectoryView(page, 'trash');
+			for (const p of stored.filter((q) => !refused(q))) {
+				try {
+					await showOne(p);
+					const at = capture.frames.length;
+					await rowButton(CONSOLE.deletePermanently(p)).click();
+					await answerRemoval(true, { action: 'delete', typedCount: 1 });
+					await C.waitForExchange(capture, 'delete', { since: at, timeout: 60000 });
+				} catch (e) {
+					refusedDelete.push(`${p}: ${errText(e)}`);
+				}
+			}
+			await C.sleep(1500);
+			await box.fill('').catch(() => {});
+			await C.showDirectoryView(page, 'active').catch(() => {});
+			// Every permanent delete the page sent in this run: only the lane's own uploads may be among them.
+			const deleteSent = C.exchanges(capture, 'delete', 0).map((x) => x.input);
+			const ownStates = {};
+			for (const p of ownUploads) ownStates[C.objectId(p)] = await store.state(fixture, C.objectId(p));
+			// What the page left behind is put right through the store, so the next run starts from the corpus
+			// as it was (the verdict is the page's): a demo document still in the trash is restored, one gone is
+			// uploaded again from the corpus, an upload of the lane's still there is deleted.
+			const cleanup = {};
+			const stuck = trashed.filter((p) => back[C.objectId(p)] !== 'active');
+			if (stuck.length) {
+				cleanup.restore = await store
+					.tool(fixture, 'restore', { object_ids: stuck.map((p) => C.objectId(p)) })
+					.then((a) => (a && a.success === true ? a.object_ids : a && (a.code || a.error)))
+					.catch(errText);
+				const gone = [];
+				for (const p of stuck) if ((await store.state(fixture, C.objectId(p))) === 'gone') gone.push(p);
+				if (gone.length) {
+					let corpus = {};
+					try {
+						corpus = demoCorpus();
+					} catch (e) {
+						cleanup.corpus = errText(e);
+					}
+					const again = gone
+						.map((p) => ({ name: p, text: corpus[p.slice(E.DEMO_PREFIX.length)] }))
+						.filter((f) => typeof f.text === 'string');
+					cleanup.uploadedAgain = again.map((f) => f.name);
+					if (again.length) await store.upload(fixture, again).catch((e) => (cleanup.upload = errText(e)));
+				}
+			}
+			const left = ownUploads.filter((p) => ownStates[C.objectId(p)] !== 'gone');
+			if (left.length)
+				cleanup.delete = await store
+					.tool(fixture, 'delete', { object_ids: left.map((p) => C.objectId(p)) })
+					.then((a) => (a && a.success === true ? a.deleted_count : a && (a.code || a.error)))
+					.catch(errText);
 			note({
-				restored: again.map((f) => f.name),
+				trashed,
+				restoreSent,
+				refusedRestore,
 				back,
+				before,
+				after,
 				ownUploads,
 				stored,
-				refused,
-				gone,
-				cleanedThroughStore: left,
-				cleaned: cleaned && (cleaned.removed || cleaned.error || cleaned.code),
+				deleteSent,
+				refusedDelete,
+				ownStates,
+				cleanup,
 			});
-			// Nothing removed or nothing uploaded means the write steps did not run: there was nothing to put back.
-			if (!removedDemo.size)
-				return 'no demo document was removed (the removal steps did not run), so nothing was restored';
-			if (!ownUploads.length)
-				return 'the lane uploaded nothing (the ingest summary step did not run), so nothing was cleaned up';
-			if (again.length !== removedDemo.size)
-				return `${removedDemo.size - again.length} removed documents are not in the corpus`;
-			if (back.some((b) => !b)) return 'a removed demo document is not back';
-			if (refused.length) return `the page did not remove ${refused[0]} (removed through the store instead)`;
-			return gone.every(Boolean)
-				? true
-				: "one of the lane's uploads is still stored (removed through the store instead)";
+			return restoreVerdict({
+				trashed: trashed.map((p) => C.objectId(p)),
+				restoreSent,
+				refusedRestore,
+				back,
+				before,
+				after,
+				own: ownUploads.map((p) => C.objectId(p)),
+				stored: stored.map((p) => C.objectId(p)),
+				deleteSent,
+				refusedDelete,
+				ownStates,
+			});
 		});
 
 		await step(page, STEP_TITLES['sign-out'], async (note) => {
@@ -3333,7 +3511,8 @@ module.exports = {
 	dedupeGroupsAt,
 	regroupThreshold,
 	dedupeVerdict,
-	removalVerdict,
+	trashVerdict,
+	restoreVerdict,
 	outliersVerdict,
 	chartsVerdict,
 	scopeVerdict,

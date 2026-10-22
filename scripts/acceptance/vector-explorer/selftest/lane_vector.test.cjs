@@ -50,7 +50,7 @@ test('a reshuffle is any change of the first row while documents load', () => {
 	assert.match(lane.reshuffled([null, null]), /no row/);
 });
 
-test('Cancel sent nothing: no removal, no upload in the frames after the click', () => {
+test('Cancel sent nothing: no write (trash, restore, delete, upsert), no upload in the frames after the click', () => {
 	const tool = (t) => ({
 		dir: 'sent',
 		msg: { type: 'request', seq: 1, command: 'rrext_process', arguments: { subcommand: 'tool', tool: t } },
@@ -59,9 +59,12 @@ test('Cancel sent nothing: no removal, no upload in the frames after the click',
 		dir: 'sent',
 		msg: { type: 'request', seq: 2, command: 'rrext_process', arguments: { subcommand: 'open' } },
 	};
-	assert.deepStrictEqual(lane.sentWrites([tool('chunks'), tool('stats')]), []);
-	assert.deepStrictEqual(lane.sentWrites([tool('chunks'), tool('remove_document')]), ['remove_document']);
+	assert.deepStrictEqual(lane.sentWrites([tool('chunks'), tool('stats'), tool('list_documents')]), []);
+	assert.deepStrictEqual(lane.sentWrites([tool('chunks'), tool('soft_delete')]), ['soft_delete']);
+	assert.deepStrictEqual(lane.sentWrites([tool('restore'), tool('upsert')]), ['restore', 'upsert']);
 	assert.deepStrictEqual(lane.sentWrites([tool('delete'), upload]), ['delete', 'upload']);
+	// A received frame is not a write the page sent.
+	assert.deepStrictEqual(lane.sentWrites([{ ...tool('delete'), dir: 'received' }]), []);
 });
 
 test('run directly the lane takes one fixture (default qdrant)', () => {

@@ -28,9 +28,23 @@ const CONSOLE = {
 	sources: 'Sources of this answer',
 	sourceOpen: /^open\b/i,
 	sourceTarget: /^Open (.+) at chunk (\d+)$/,
-	trash: (p) => `Remove ${p} from the database`,
-	removeConfirm: 'Remove document',
-	// A shared rocketride_vector table asks for its name typed before "Remove document" is enabled.
+	// A directory row's buttons (DocumentRow.tsx): Move to trash in the Documents view; Restore (at once,
+	// nothing to confirm) and Delete permanently in the Trash view.
+	trash: (p) => `Move ${p} to the trash`,
+	restore: (p) => `Restore ${p}`,
+	deletePermanently: (p) => `Delete ${p} permanently`,
+	// The directory title's Documents / Trash switch (aria-pressed buttons); "Trash (N)" is the store's
+	// stats.deleted_documents, plain "Trash" when the store gives no count. Empty trash shows in the Trash view.
+	views: 'Documents or trash',
+	documentsView: /^Documents$/,
+	trashView: /^Trash(?: \(([\d,]+)\))?$/,
+	emptyTrash: 'Empty trash',
+	// The confirm buttons (vector/confirm.ts). A move to the trash (one document, several) asks for nothing
+	// typed; a permanent delete (one, several, Empty trash) is destructive.
+	trashConfirm: /^(?:Move to trash|Move [\d,]+ documents to the trash)$/,
+	deleteConfirm: /^(?:Delete permanently|Delete [\d,]+ documents permanently|Empty trash)$/,
+	// A shared rocketride_vector table asks for its name typed before a permanent delete is enabled; other
+	// stores ask for the count (`Type N to confirm.`) before deleting several documents or emptying the trash.
 	typedConfirm: /Type the table name '([^']+)' to confirm/,
 	filterPaths: 'Filter paths…',
 	cancel: 'Cancel',

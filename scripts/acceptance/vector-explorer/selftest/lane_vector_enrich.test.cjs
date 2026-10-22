@@ -251,8 +251,8 @@ const GE3 = [
 	/threshold slider/,
 	/Compare/,
 	/55 %/,
-	/duplicates removal/,
-	/outlier removal/,
+	/duplicates to the trash/,
+	/outlier to the trash/,
 	/ingest summary \(P1-9\)/,
 	/restore/,
 	/sign-out/,
@@ -1633,33 +1633,101 @@ test(
 	}
 );
 
-test('removalVerdict: exactly the expected documents, batches of at most 100, the stats dropped by them', () => {
-	const before = { documents: 40, chunks: 300 };
-	const sound = {
-		expected: ['a', 'b'],
-		sent: [{ object_ids: ['a', 'b'] }],
-		before,
-		after: { documents: 38, chunks: 288 },
-		chunks: 12,
-	};
-	assert.strictEqual(lane.removalVerdict(sound), true);
-	assert.strictEqual(lane.removalVerdict({ ...sound, sent: [{ object_id: 'a' }, { object_id: 'b' }] }), true);
-	const broken = {
-		'one more': { sent: [{ object_ids: ['a', 'b', 'c'] }] },
-		'one fewer': { sent: [{ object_ids: ['a'] }] },
-		'a batch above 100': {
-			expected: Array.from({ length: 101 }, (_, i) => `d${i}`),
-			sent: [{ object_ids: Array.from({ length: 101 }, (_, i) => `d${i}`) }],
-			after: { documents: -61, chunks: 0 },
-			chunks: null,
-		},
-		'stats unchanged': { after: before },
-		'chunks unchanged': { after: { documents: 38, chunks: 300 } },
-		'not read': { after: null },
-	};
-	for (const [what, change] of Object.entries(broken))
-		assert.notStrictEqual(lane.removalVerdict({ ...sound, ...change }), true, what);
-});
+test(
+	'trashVerdict: exactly the expected documents to soft_delete in batches of at most 100, none deleted, ' +
+		'each in the trash, the active stats dropped and the trash grew by them',
+	() => {
+		const before = { documents: 40, chunks: 300, deleted_documents: 0 };
+		const sound = {
+			expected: ['a', 'b'],
+			sent: [{ object_ids: ['a', 'b'] }],
+			deleted: 0,
+			before,
+			after: { documents: 38, chunks: 288, deleted_documents: 2 },
+			chunks: 12,
+			states: { a: 'trash', b: 'trash' },
+		};
+		assert.strictEqual(lane.trashVerdict(sound), true);
+		assert.strictEqual(lane.trashVerdict({ ...sound, sent: [{ object_ids: ['a'] }, { object_ids: ['b'] }] }), true);
+		// A store that cannot count its trash says null: the other figures still decide.
+		const uncounted = { ...before, deleted_documents: null };
+		assert.strictEqual(
+			lane.trashVerdict({ ...sound, before: uncounted, after: { ...sound.after, deleted_documents: null } }),
+			true
+		);
+		assert.strictEqual(lane.trashVerdict({ ...sound, chunks: null, after: { ...sound.after, chunks: 300 } }), true);
+		const broken = {
+			'one more': { sent: [{ object_ids: ['a', 'b', 'c'] }] },
+			'one fewer': { sent: [{ object_ids: ['a'] }] },
+			'a single object_id is not the soft_delete input': { sent: [{ object_id: 'a' }, { object_id: 'b' }] },
+			'a batch above 100': {
+				expected: Array.from({ length: 101 }, (_, i) => `d${i}`),
+				sent: [{ object_ids: Array.from({ length: 101 }, (_, i) => `d${i}`) }],
+				states: Object.fromEntries(Array.from({ length: 101 }, (_, i) => [`d${i}`, 'trash'])),
+				after: { documents: -61, chunks: 0, deleted_documents: 101 },
+				chunks: null,
+			},
+			'a permanent delete went out': { deleted: 1 },
+			'one still active': { states: { a: 'trash', b: 'active' } },
+			'one deleted for good': { states: { a: 'trash', b: 'gone' } },
+			'states not read': { states: null },
+			'stats unchanged': { after: before },
+			'chunks unchanged': { after: { documents: 38, chunks: 300, deleted_documents: 2 } },
+			'the trash did not grow': { after: { documents: 38, chunks: 288, deleted_documents: 0 } },
+			'the trash count went missing': { after: { documents: 38, chunks: 288, deleted_documents: null } },
+			'not read': { after: null },
+		};
+		for (const [what, change] of Object.entries(broken))
+			assert.notStrictEqual(lane.trashVerdict({ ...sound, ...change }), true, what);
+	}
+);
+
+test(
+	"restoreVerdict: the trashed demo documents restored from the Trash and active again, the lane's own " +
+		'deleted permanently and gone, no demo document ever deleted',
+	() => {
+		const sound = {
+			trashed: ['a', 'b'],
+			restoreSent: [{ object_ids: ['a'] }, { object_ids: ['b'] }],
+			refusedRestore: [],
+			back: { a: 'active', b: 'active' },
+			before: { documents: 38, deleted_documents: 2 },
+			after: { documents: 40, deleted_documents: 0 },
+			own: ['u1', 'u2'],
+			stored: ['u1', 'u2'],
+			deleteSent: [{ object_ids: ['u1'] }, { object_ids: ['u2'] }],
+			refusedDelete: [],
+			ownStates: { u1: 'gone', u2: 'gone' },
+		};
+		assert.strictEqual(lane.restoreVerdict(sound), true);
+		assert.strictEqual(
+			lane.restoreVerdict({
+				...sound,
+				before: { documents: 38, deleted_documents: null },
+				after: { documents: 40, deleted_documents: null },
+			}),
+			true
+		);
+		const broken = {
+			'nothing was trashed': { trashed: [] },
+			'nothing was uploaded': { own: [], stored: [], deleteSent: [], ownStates: {} },
+			'one not restored': { restoreSent: [{ object_ids: ['a'] }] },
+			'one more restored': { restoreSent: [{ object_ids: ['a', 'b', 'c'] }] },
+			'the page refused one': { refusedRestore: ['b: no row'] },
+			'one still in the trash': { back: { a: 'active', b: 'trash' } },
+			'stats did not grow': { after: { documents: 38, deleted_documents: 0 } },
+			'the trash did not shrink': { after: { documents: 40, deleted_documents: 2 } },
+			'stats not read': { after: null },
+			'a demo document deleted permanently': { deleteSent: [{ object_ids: ['u1', 'u2', 'a'] }] },
+			'one upload not deleted': { deleteSent: [{ object_ids: ['u1'] }] },
+			'the page refused a delete': { refusedDelete: ['u2: no row'] },
+			'one upload still in the trash': { ownStates: { u1: 'gone', u2: 'trash' } },
+			'one upload still active': { ownStates: { u1: 'gone', u2: 'active' } },
+		};
+		for (const [what, change] of Object.entries(broken))
+			assert.notStrictEqual(lane.restoreVerdict({ ...sound, ...change }), true, what);
+	}
+);
 
 test('outliersVerdict: the OCR junk first with its why, more rows at 5 %, no sample request', () => {
 	const sample = sampleOf();
@@ -2354,12 +2422,12 @@ const SOURCES = [
 			'step={THRESHOLD_STEP}',
 		],
 	],
-	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Remove all queued (${', "'shortest-path'"]],
+	['E6', 'map/reviewWording.ts', 'removeAllLabel', ['Move all queued to the trash (${', "'shortest-path'"]],
 	[
 		'E6',
 		'components/OutliersPanel.tsx',
 		'data-component="OutliersPanel"',
-		['Remove document', '<select', 'aria-label="Outliers"'],
+		['Move to trash', '<select', 'aria-label="Outliers"'],
 	],
 	['E6', 'map/outliers.ts', 'whyText', ['vs sample median ${']],
 	['E6', 'components/ChunkTextPanel.tsx', null, ["'Show full text'", "'Hide full text'", '<mark']],

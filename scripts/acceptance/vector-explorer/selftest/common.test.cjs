@@ -70,7 +70,10 @@ test('privacy: a request with a vector no embed answer returned is a violation',
 });
 
 test('privacy: raw vectors in any other answer are a violation; vectors may carry two', () => {
-	assert.strictEqual(C.privacyViolations(pair('documents', {}, { items: [{ embedding: vec(3) }] }), DIM).length, 1);
+	assert.strictEqual(
+		C.privacyViolations(pair('list_documents', {}, { items: [{ embedding: vec(3) }] }), DIM).length,
+		1
+	);
 	assert.deepStrictEqual(
 		C.privacyViolations(pair('vectors', {}, { items: [{ values: vec(1) }, { values: vec(2) }] }), DIM),
 		[]
@@ -101,7 +104,7 @@ test('privacy: sample columns of n values are not vectors, other keys in a sampl
 		[]
 	);
 	assert.deepStrictEqual(
-		C.privacyViolations(pair('documents', {}, { ids: Array.from({ length: DIM }, (_, i) => i) }), DIM),
+		C.privacyViolations(pair('list_documents', {}, { ids: Array.from({ length: DIM }, (_, i) => i) }), DIM),
 		[]
 	);
 });
@@ -282,8 +285,56 @@ test('isUpload recognises the SDK upload requests only', () => {
 	assert.ok(!C.isUpload(null));
 });
 
+test('the write tools are the shared set: soft_delete, restore, delete, upsert', () => {
+	assert.deepStrictEqual([...C.WRITE_TOOLS].sort(), ['delete', 'restore', 'soft_delete', 'upsert']);
+	assert.ok(!C.WRITE_TOOLS.includes('remove_document'));
+});
+
+test('documentStateOf reads a chunks answer as active, in the trash or gone, nothing else', () => {
+	const items = [{ chunkId: 0, text: 'a' }];
+	assert.strictEqual(C.documentStateOf({ success: true, items }), 'active');
+	assert.strictEqual(
+		C.documentStateOf({
+			success: false,
+			code: 'IN_TRASH',
+			error: "chunks: the document 'd' is in the trash; restore it to read it",
+			object_id: 'd',
+		}),
+		'trash'
+	);
+	assert.strictEqual(C.documentStateOf({ success: false, code: 'NOT_FOUND', error: 'no such document' }), 'gone');
+	// Anything else is not a state a lane may take for one of the three.
+	for (const answer of [
+		{ success: true, items: [] },
+		{ success: true },
+		{ success: false, code: 'BUSY' },
+		{ success: false },
+		null,
+		undefined,
+	]) {
+		const state = C.documentStateOf(answer);
+		assert.ok(!['active', 'trash', 'gone'].includes(state), `${JSON.stringify(answer)} -> ${state}`);
+	}
+});
+
 test("the selector table holds the app's wording", () => {
-	assert.strictEqual(CONSOLE.trash('C:/demo/a.md'), 'Remove C:/demo/a.md from the database');
+	assert.strictEqual(CONSOLE.trash('C:/demo/a.md'), 'Move C:/demo/a.md to the trash');
+	assert.strictEqual(CONSOLE.restore('C:/demo/a.md'), 'Restore C:/demo/a.md');
+	assert.strictEqual(CONSOLE.deletePermanently('C:/demo/a.md'), 'Delete C:/demo/a.md permanently');
+	// The confirm buttons: a move to the trash (one, several) is never a permanent delete, and back.
+	for (const label of ['Move to trash', 'Move 3 documents to the trash', 'Move 1,200 documents to the trash'])
+		assert.ok(CONSOLE.trashConfirm.test(label), label);
+	for (const label of ['Delete permanently', 'Delete 3 documents permanently', 'Empty trash'])
+		assert.ok(CONSOLE.deleteConfirm.test(label), label);
+	for (const label of ['Delete permanently', 'Empty trash', 'Move C:/demo/a.md to the trash', 'Cancel'])
+		assert.ok(!CONSOLE.trashConfirm.test(label), label);
+	for (const label of ['Move to trash', 'Delete C:/demo/a.md permanently', 'Delete selected permanently', 'Cancel'])
+		assert.ok(!CONSOLE.deleteConfirm.test(label), label);
+	// The Documents / Trash switch: "Trash (N)" counts the store's trash, "Trash" when it gives no count.
+	assert.deepStrictEqual(CONSOLE.trashView.exec('Trash (1,234)').slice(1), ['1,234']);
+	assert.strictEqual(CONSOLE.trashView.exec('Trash')[1], undefined);
+	assert.ok(!CONSOLE.trashView.test('Empty trash'));
+	assert.ok(CONSOLE.documentsView.test('Documents') && !CONSOLE.documentsView.test('Documents or trash'));
 	assert.ok(MAP.nativeGraph('Qdrant').test('… · neighbour graph computed by Qdrant · …'));
 	assert.ok(MAP.nodeGraph.test('… · neighbour graph computed by the store node · …'));
 	assert.ok(MAP.layoutNotBetter.test('Neighbour layout did not improve on PCA for this sample'));
@@ -339,6 +390,27 @@ test("the selectors the lanes read exist in the app's source", () => {
 		'12',
 	]);
 	assert.match(src('vector/confirm.ts'), /prompt: `Type the table name '\$\{table\}' to confirm\.`/);
+	// The directory row's buttons, the title's Documents / Trash switch, Empty trash and the confirm buttons.
+	const row = src('components/DocumentRow.tsx');
+	for (const name of ['Move ${label} to the trash', 'Restore ${label}', 'Delete ${label} permanently'])
+		assert.ok(row.includes(`aria-label={\`${name}\`}`), `DocumentRow.tsx names a button ${name}`);
+	const directory = src('components/DocumentDirectory.tsx');
+	assert.ok(directory.includes(`aria-label="${CONSOLE.views}"`), 'the Documents / Trash switch');
+	assert.ok(
+		directory.includes(
+			"which === 'active' ? 'Documents' : trashCount === null ? 'Trash' : `Trash (${formatCount(trashCount)})`"
+		)
+	);
+	assert.ok(directory.includes(CONSOLE.emptyTrash), 'the Empty trash button');
+	const confirm = src('vector/confirm.ts');
+	for (const label of [
+		"confirmLabel: 'Move to trash'",
+		'confirmLabel: `Move ${n} documents to the trash`',
+		"confirmLabel: 'Delete permanently'",
+		'confirmLabel: `Delete ${formatCount(n)} documents permanently`',
+		"confirmLabel: 'Empty trash'",
+	])
+		assert.ok(confirm.includes(label), `confirm.ts: ${label}`);
 	assert.deepStrictEqual(CONSOLE.typedConfirm.exec("Type the table name 'vx_demo_rr' to confirm.").slice(1), [
 		'vx_demo_rr',
 	]);
