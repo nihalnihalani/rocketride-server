@@ -312,7 +312,7 @@ def test_a_store_that_cannot_filter_answers_none_and_leaves_every_key_to_the_app
     assert answer['success'] is True
     assert answer['filter_applied'] == 'none'
     assert answer['filter_ignored'] == ['path_prefix', 'file_types'], 'in DOC_LIST_FILTER_KEYS order'
-    assert answer['caveats'] == ['documents_unsorted', 'documents_filter_client']
+    assert answer['caveats'] == ['documents_by_first_chunk', 'documents_unsorted', 'documents_filter_client']
     assert answer['items'] == plain['items'], 'the rows are the unfiltered ones; the app filters them'
     assert list(answer).index('filter_applied') < list(answer).index('caveats')
 

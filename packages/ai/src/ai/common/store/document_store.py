@@ -525,7 +525,9 @@ class DocumentStoreBase(ABC):
         Default (``distinct=False``, ``sorted=False``):
         ``get(DocFilter(chunkIds=[0], deleted=deleted, limit=limit + 1, offset=cursor.offset))``,
         sorted by ``(parent, objectId)`` within the page; ``chunks=None``,
-        ``counts_exact=False``, ``total=None``. The opaque cursor is
+        ``counts_exact=False``, ``total=None``, caveat ``documents_by_first_chunk`` (a
+        document is listed by its chunk 0; the ``list_documents`` tool reads the trash after
+        the last page for the documents whose chunk 0 is there but which have a live chunk). The opaque cursor is
         ``{'o': offset, 'f': first key of the previous page}``; when a page's first key
         equals ``cursor['f']`` the backend ignored the offset, so the page ends with
         ``next_cursor=None`` and the caveat ``'documents_paging_unsupported'``.
@@ -553,7 +555,7 @@ class DocumentStoreBase(ABC):
                 counts_exact=False,
                 distinct=False,
                 sorted=False,
-                caveats=['documents_paging_unsupported'],
+                caveats=['documents_by_first_chunk', 'documents_paging_unsupported'],
                 filter_ignored=ignored,
             )
         items = [
@@ -572,7 +574,7 @@ class DocumentStoreBase(ABC):
             counts_exact=False,
             distinct=False,
             sorted=False,
-            caveats=[],
+            caveats=['documents_by_first_chunk'],
             filter_ignored=ignored,
         )
 

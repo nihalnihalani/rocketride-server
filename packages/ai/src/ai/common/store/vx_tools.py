@@ -82,6 +82,7 @@ from .vx_types import (
     SAMPLE_STRATEGIES,
     SUPPORT_LEVELS,
     DocListFilter,
+    DocPage,
     DocumentRow,
     parse_doc_list_filter,
 )
@@ -660,6 +661,24 @@ def _invalid(message: str) -> ToolRefusal:
 
 #: The caveat a ``documents`` answer carries for each ``filter_applied`` (none for ``'server'``).
 _FILTER_CAVEATS: Dict[str, str] = {'partial': 'documents_filter_partial', 'none': 'documents_filter_client'}
+
+#: The tool's own cursor key and value for the second phase of an Active listing (the trash's
+#: documents that still have a live chunk; see ``_vx_list_documents``).
+_TRASH_PHASE_KEY = 'vx_phase'
+_TRASH_PHASE = 'trash_live'
+
+#: Live chunks one read may return when telling which trashed documents still have one.
+_LIVE_READ_ROWS = 1000
+
+#: ``stats`` reads the trash of a store that counts by chunk 0 while it holds at most this
+#: many documents, in at most this many calls (contract section 4.5).
+_STATS_TRASH_READ_MAX = 1000
+_STATS_TRASH_READ_PAGES = 8
+
+
+def _trash_phase_cursor(inner: Optional[str]) -> str:
+    """The cursor of the second phase of an Active listing, around the driver's trash cursor."""
+    return encodeCursor({_TRASH_PHASE_KEY: _TRASH_PHASE, 'c': inner})
 
 
 def _doc_list_filter_arg(args: Mapping[str, Any]) -> Optional[DocListFilter]:
@@ -1363,6 +1382,10 @@ class VectorExplorerTools:
         deleted_documents = self._vx_count(store.countDocumentsWhere, deletedFilter('deleted'))
         if deleted_documents is None and 'documents_by_first_chunk' in caveats:
             deleted_documents = self._vx_count(store.countChunks, deletedFilter('deleted', chunkIds=[0]))
+        if 'documents_by_first_chunk' in caveats and deleted_documents:
+            # Counted by chunk 0: a document whose chunk 0 is in the trash but a later chunk is
+            # live is a document too; the trash is read for them while it is small.
+            documents += self._vx_count_live_in_trash(store, deleted_documents) or 0
         tables = self._vx_count(store.countChunks, deletedFilter('active', isTable=True))
         if documents is None and chunks is None and deleted_chunks is None and tables is None:
             caveats.append('no_filtered_count')
@@ -1376,6 +1399,24 @@ class VectorExplorerTools:
             'avg_chunks_per_document': _round(chunks / documents, 5) if chunks is not None and documents else None,
             'caveats': caveats,
         }
+
+    def _vx_count_live_in_trash(self, store: Any, trashed: int) -> Optional[int]:
+        """The documents of the trash that still have a live chunk and no live chunk 0.
+
+        None (not counted) when the trash holds more than ``_STATS_TRASH_READ_MAX``
+        documents or the read does not end within a few pages.
+        """
+        if trashed > _STATS_TRASH_READ_MAX:
+            return None
+        found, cursor = 0, None
+        for _ in range(_STATS_TRASH_READ_PAGES):
+            _page, rows, cursor = self._vx_live_in_trash(
+                store, cursor, limit=LIMITS['documents_page'], object_ids=None, sort='path', hook_args={}, parent=None
+            )
+            found += len(rows)
+            if cursor is None:
+                return found
+        return None
 
     def _vx_stats(self, store: Any, mode: str) -> Dict[str, Any]:
         """The ``stats`` answer: legacy keys plus the explorer's figures (see the contract, ``stats``).
@@ -1523,6 +1564,13 @@ class VectorExplorerTools:
         exactly that path (handed to the driver as a ``path_prefix`` where it filters, then
         matched exactly here, so ``total`` is null); an ``offset`` other than 0 is refused,
         since the listing pages with ``cursor``.
+
+        Active means "has a live chunk". A driver that lists by chunk 0 (its page carries
+        ``documents_by_first_chunk``) misses a document whose chunk 0 is in the trash but a
+        later chunk is live (a ``soft_delete`` during its ingest), so after that driver's
+        last Active page the listing goes on through the trash and keeps the documents
+        there that still have a live chunk (:meth:`_vx_live_in_trash`); its cursor is this
+        tool's own and only an Active listing takes it.
         """
         vx_write_gate.check_read()
         store = self._vx_store()
@@ -1536,13 +1584,20 @@ class VectorExplorerTools:
         if isinstance(args.get('deleted'), bool):
             args = {**args, 'deleted': 'deleted' if args['deleted'] else 'active'}
         cursor = args.get('cursor')
+        trash_phase = False
         if cursor is not None:
             if not isinstance(cursor, str):
                 raise invalidCursor()
             try:
-                decodeCursor(cursor)
+                state = decodeCursor(cursor)
             except ValueError:
                 raise invalidCursor() from None
+            if state.get(_TRASH_PHASE_KEY) is not None:
+                # The second phase of an Active listing: the driver's own trash cursor inside.
+                inner = state.get('c')
+                if state[_TRASH_PHASE_KEY] != _TRASH_PHASE or (inner is not None and not isinstance(inner, str)):
+                    raise invalidCursor()
+                trash_phase, cursor = True, inner
         limit = _clamped(
             _int_arg(args, 'limit', DEFAULTS['documents_page']), 1, LIMITS['documents_page'], 'limit', warnings
         )
@@ -1550,6 +1605,8 @@ class VectorExplorerTools:
         if object_ids is not None:
             object_ids = _strings_arg(object_ids, 'object_ids', LIMITS['documents_page'])
         deleted = _deleted_arg(args)
+        if trash_phase and deleted != 'active':
+            raise invalidCursor()
         sort = args.get('sort', 'path') or 'path'
         if sort != 'path':
             raise _invalid("sort must be 'path'.")
@@ -1563,9 +1620,40 @@ class VectorExplorerTools:
             hook_filter = dataclasses.replace(doc_filter or DocListFilter(), path_prefix=parent)
         hand_over = hook_filter is not None and filters
         hook_args: Dict[str, Any] = {'filter': hook_filter} if hand_over else {}
-        page = store.listDocumentPage(
-            cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort, **hook_args
-        )
+        listing = {'limit': limit, 'object_ids': object_ids, 'sort': sort, 'hook_args': hook_args, 'parent': parent}
+        if trash_phase:
+            page, rows, inner_next = self._vx_live_in_trash(store, cursor, **listing)
+            next_cursor = _trash_phase_cursor(inner_next) if inner_next is not None else None
+            total = None
+        else:
+            page = store.listDocumentPage(
+                cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort, **hook_args
+            )
+            rows = [
+                row
+                for row in page.items
+                if row.objectId != CONTROL_OBJECT_ID and (parent is None or row.path == parent)
+            ]
+            next_cursor = page.next_cursor
+            total = page.total if parent is None else None
+            if (
+                deleted == 'active'
+                and next_cursor is None
+                and 'documents_by_first_chunk' in page.caveats
+                and 'documents_paging_unsupported' not in page.caveats
+                and self._vx_trash_may_hold(store, object_ids)
+            ):
+                # The driver's last Active page: the trash may still hold documents with a live chunk.
+                # Room left on the page takes them from one page of the trash; a full page hands
+                # the trash on to the next call; an empty one reads on now, since a client takes
+                # an empty page for the end.
+                if len(rows) >= limit:
+                    next_cursor = _trash_phase_cursor(None)
+                else:
+                    room = dict(listing, limit=limit - len(rows)) if rows else listing
+                    _trash_page, more, inner_next = self._vx_live_in_trash(store, None, single_page=bool(rows), **room)
+                    rows = rows + more
+                    next_cursor = _trash_phase_cursor(inner_next) if inner_next is not None else None
         items = [
             {
                 'objectId': row.objectId,
@@ -1584,8 +1672,7 @@ class VectorExplorerTools:
                 'max_chunk_id': _whole_number(getattr(row, 'max_chunk_id', None)),
                 'deleted_chunks': _whole_number(getattr(row, 'deleted_chunks', None)),
             }
-            for row in page.items
-            if row.objectId != CONTROL_OBJECT_ID and (parent is None or row.path == parent)
+            for row in rows
         ]
         caveats = list(page.caveats)
         if not page.sorted and 'documents_unsorted' not in caveats:
@@ -1593,8 +1680,8 @@ class VectorExplorerTools:
         answer: Dict[str, Any] = {
             'success': True,
             'items': items,
-            'next_cursor': page.next_cursor,
-            'total': page.total if parent is None else None,
+            'next_cursor': next_cursor,
+            'total': total,
             'counts_exact': page.counts_exact,
             'distinct': page.distinct,
             'sorted': page.sorted,
@@ -1614,6 +1701,92 @@ class VectorExplorerTools:
         if warnings:
             answer['warnings'] = ['limit_clamped']
         return answer
+
+    def _vx_trash_may_hold(self, store: Any, object_ids: Optional[Sequence[str]]) -> bool:
+        """Whether the trash may hold a document of the listing (False only when the store counts none)."""
+        trashed = self._vx_count(
+            store.countChunks, deletedFilter('deleted', objectIds=list(object_ids) if object_ids else None)
+        )
+        return trashed != 0
+
+    def _vx_live_in_trash(
+        self,
+        store: Any,
+        cursor: Optional[str],
+        *,
+        limit: int,
+        object_ids: Optional[Sequence[str]],
+        sort: str,
+        hook_args: Mapping[str, Any],
+        parent: Optional[str],
+        single_page: bool = False,
+    ) -> Tuple[DocPage, List[DocumentRow], Optional[str]]:
+        """The documents of the trash that still have a live chunk, as Active rows: ``(page, rows, next)``.
+
+        Reads the driver's Trash listing from ``cursor`` (its own cursor), one page and one
+        batched read of the page's live chunks at a time, until a page holds such a
+        document or the trash ends, so it never answers no rows with a cursor
+        (``single_page``: one page, for a caller that has rows of its own). A document
+        with a live chunk 0 is left out (the driver's Active pages list it). The rows say
+        ``deleted: false`` and ``has_first_chunk: false``, and count the live chunks where
+        one read held them all. ``next`` is the driver's cursor for the rest of the trash.
+        """
+        passed = set()
+        while True:
+            page = store.listDocumentPage(
+                cursor=cursor, limit=limit, object_ids=object_ids, deleted='deleted', sort=sort, **hook_args
+            )
+            candidates = [
+                row
+                for row in page.items
+                if row.objectId != CONTROL_OBJECT_ID and (parent is None or row.path == parent)
+            ]
+            live = self._vx_live_chunks(store, [row.objectId for row in candidates])
+            rows = [
+                dataclasses.replace(row, deleted=False, has_first_chunk=False, chunks=live[row.objectId], tables=None)
+                for row in candidates
+                if row.objectId in live
+            ]
+            following = page.next_cursor
+            if 'documents_paging_unsupported' in page.caveats or following == cursor or following in passed:
+                following = None
+            if rows or following is None or single_page:
+                return page, rows, following
+            passed.add(following)
+            cursor = following
+
+    def _vx_live_chunks(self, store: Any, object_ids: Sequence[str]) -> Dict[str, Optional[int]]:
+        """The ids among ``object_ids`` with a live chunk but no live chunk 0, each with its live chunk count.
+
+        One count when none of them has a live chunk (a trash page usually); otherwise one
+        read of their live chunks (at most ``_LIVE_READ_ROWS``), the count None when it held
+        more, and then a one-row read for each id that read did not show.
+        """
+        ids = [oid for oid in dict.fromkeys(object_ids) if oid != CONTROL_OBJECT_ID]
+        if not ids:
+            return {}
+        if self._vx_count(store.countChunks, deletedFilter('active', objectIds=ids)) == 0:
+            return {}
+        wanted = set(ids)
+        docs = store.get(deletedFilter('active', objectIds=ids, limit=_LIVE_READ_ROWS + 1, offset=0))
+        tally: Dict[str, int] = {}
+        first: set = set()
+        for doc in docs:
+            oid = metadataValue(doc, 'objectId')
+            if oid in wanted and matchesDeleted(doc, 'active'):
+                tally[oid] = tally.get(oid, 0) + 1
+                if _int_or_none(metadataValue(doc, 'chunkId')) == 0:
+                    first.add(oid)
+        if len(docs) <= _LIVE_READ_ROWS:
+            return {oid: count for oid, count in tally.items() if oid not in first}
+        # More live chunks than one read returns: the documents seen have one; each other id is read once.
+        live: Dict[str, Optional[int]] = {oid: None for oid in tally}
+        for oid in ids:
+            if oid not in live and self._vx_has_live_chunk(store, oid):
+                live[oid] = None
+        firsts = store.get(deletedFilter('active', objectIds=list(live), chunkIds=[0], limit=2 * len(live), offset=0))
+        first |= {metadataValue(doc, 'objectId') for doc in firsts if matchesDeleted(doc, 'active')}
+        return {oid: count for oid, count in live.items() if oid not in first}
 
     # ------------------------------------------------------------------
     # chunks

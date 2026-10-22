@@ -610,7 +610,7 @@ def test_list_documents_default_lists_first_chunks_sorted_within_the_page():
     assert [row.objectId for row in page.items] == ['a', 'b', 'c']
     assert (page.distinct, page.sorted, page.counts_exact, page.total) == (False, False, False, None)
     assert all(row.chunks is None and row.has_first_chunk for row in page.items)
-    assert page.next_cursor is None and page.caveats == []
+    assert page.next_cursor is None and page.caveats == ['documents_by_first_chunk']
 
 
 def test_list_documents_default_never_lists_the_control_record():
@@ -651,7 +651,7 @@ def test_list_documents_default_on_an_offset_ignoring_backend_ends_with_a_caveat
     second = store.listDocumentPage(cursor=first.next_cursor, limit=2, object_ids=None, deleted='active', sort='path')
     assert second.items == []
     assert second.next_cursor is None
-    assert second.caveats == ['documents_paging_unsupported']
+    assert second.caveats == ['documents_by_first_chunk', 'documents_paging_unsupported']
 
 
 def test_list_documents_default_filters_by_object_ids():
