@@ -106,6 +106,8 @@ export const CAVEATS = [
 	'listing_truncated',
 	'documents_filter_partial',
 	'documents_filter_client',
+	// The trash (contract section 4.5).
+	'trash_scan_cut',
 ] as const;
 
 /** A documented caveat. */

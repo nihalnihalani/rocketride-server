@@ -226,6 +226,104 @@ def test_a_cursor_of_the_second_phase_is_refused_by_another_listing(context):
     assert following['total'] is None, following
 
 
+def _spy_trash_reads(store) -> List[int]:
+    """Record the documents each read of the store's Trash listing returns."""
+    reads: List[int] = []
+    listing = store.listDocumentPage
+
+    def spy(**kw):
+        page = listing(**kw)
+        if kw['deleted'] == 'deleted':
+            reads.append(len(page.items))
+        return page
+
+    store.listDocumentPage = spy
+    return reads
+
+
+def test_the_end_of_an_active_listing_reads_a_bounded_part_of_a_big_trash(context):
+    store, docs, model, logical = _store('counting')
+    gone = [f'gone-{n:04d}' for n in range(3000)]
+    store.addChunks(docs(LIVE, [0, 1]) + [chunk for oid in gone for chunk in docs(oid, [0, 1])])
+    store.markDeleted(gone)
+    tools = _node(store, logical, model)
+    reads = _spy_trash_reads(store)
+    pages = []
+    cursor = None
+    for _ in range(20):
+        page = tools.list_documents({'deleted': 'active', 'limit': 200, 'cursor': cursor})
+        assert page['success'] and (page['items'] or page['next_cursor'] is None), page
+        pages.append(page)
+        cursor = page['next_cursor']
+        if cursor is None:
+            break
+    assert [row['objectId'] for page in pages for row in page['items']] == [LIVE]
+    assert sum(reads) <= 1000 and len(reads) <= 6, ('the listing reads at most 1,000 trashed documents', reads)
+    assert 'trash_scan_cut' in pages[-1]['caveats'], pages[-1]
+    assert all('trash_scan_cut' not in page['caveats'] for page in pages[:-1])
+
+
+def test_a_trash_read_to_its_end_does_not_say_it_was_cut(context):
+    _store_, tools = _setup('counting')
+    rows = _listing(tools, deleted='active', limit=1)
+    assert sorted(row['objectId'] for row in rows) == [LIVE, PART]
+    for limit in (1, 200):
+        cursor = None
+        while True:
+            page = tools.list_documents({'deleted': 'active', 'limit': limit, 'cursor': cursor})
+            assert 'trash_scan_cut' not in page['caveats'], page
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+
+
+def test_the_bound_stops_a_trash_read_and_the_listing_says_so(context, monkeypatch):
+    from ai.common.store import vx_tools
+
+    _store_, tools = _setup('memory')
+    monkeypatch.setattr(vx_tools, '_TRASH_READ_PAGES', 1)
+    monkeypatch.setattr(vx_tools, '_TRASH_READ_MAX', 1)
+    pages = []
+    cursor = None
+    while True:
+        page = tools.list_documents({'deleted': 'active', 'limit': 1, 'cursor': cursor})
+        assert page['items'] or page['next_cursor'] is None, page
+        pages.append(page)
+        cursor = page['next_cursor']
+        if cursor is None:
+            break
+    assert [row['objectId'] for page in pages for row in page['items']] == [LIVE], 'the read stopped before PART'
+    assert 'trash_scan_cut' in pages[-1]['caveats'], pages[-1]
+
+
+def test_stats_leave_out_a_trash_read_that_was_cut(context, monkeypatch):
+    _store_, tools = _setup('chroma')
+
+    def cut(self, store, cursor, **_kw):
+        return SimpleNamespace(caveats=[], items=[]), [], None, 1000, True
+
+    monkeypatch.setattr(Node, '_vx_live_in_trash', cut)
+    stats = tools.stats({'mode': 'full'})
+    assert (stats['documents'], stats.get('caveats')) == (1, ['documents_by_first_chunk']), stats
+
+
+@pytest.mark.parametrize('kind', sorted(FIRST_CHUNK_LISTINGS))
+def test_a_store_that_lists_by_chunk_0_answers_no_total_while_the_trash_may_hold_documents(context, kind):
+    _store_, tools = _setup(kind)
+    first = tools.list_documents({'deleted': 'active', 'limit': 1})
+    assert first['success'] and first['total'] is None, (kind, first['total'])
+
+
+@pytest.mark.parametrize('kind', ['astra_db', 'milvus', 'weaviate'])
+def test_a_store_that_lists_by_chunk_0_keeps_its_total_with_an_empty_trash(context, kind):
+    store, docs, model, logical = _store(kind)
+    store.addChunks(docs(LIVE, [0, 1]) + docs(FULL, [0, 1]))
+    tools = _node(store, logical, model)
+    page = tools.list_documents({'deleted': 'active'})
+    assert page['success'] and page['total'] == 2, (kind, page['total'])
+    assert 'trash_scan_cut' not in page['caveats']
+
+
 def test_a_dap_caller_reads_the_same_listing(context):
     context['ctx'] = dap()
     _store_, tools = _setup('weaviate')

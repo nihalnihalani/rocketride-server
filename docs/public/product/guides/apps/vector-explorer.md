@@ -543,6 +543,7 @@ sentence:
 | The server runs pgvector older than 0.8, whose index search can stop short when a search is limited to some documents | A search limited to some documents may return fewer results than asked: this pgvector is older than 0.8. |
 | The map's sample was drawn from the first 500 documents of a larger collection | Sampled from the first 500 documents by path; the collection has more |
 | The store's document listing stopped early | Sampled from part of the collection: the store's listing stopped early |
+| The store lists documents by their first chunk and its trash was too large to read to the end | The trash is large, so only part of it was read: a document moved to the trash during its upload may be missing from this list. |
 | The store applied some of a scope's conditions | N documents match (store; ingest dates filtered here) |
 | The store cannot filter documents | N of M loaded match (filtered here; the store cannot filter by these) |
 | The store node does not compute clusters | This store node does not compute clusters; update the node. |

@@ -105,6 +105,7 @@ export const CAVEAT_SENTENCES: Readonly<Record<Caveat, string>> = {
 	listing_truncated: "Sampled from part of the collection: the store's document listing stopped before its end.",
 	documents_filter_partial: 'The store applied some of these conditions; the rest are filtered here, over the documents loaded.',
 	documents_filter_client: 'This store cannot filter its documents by these conditions; they are filtered here, over the documents loaded.',
+	trash_scan_cut: 'The trash is large, so only part of it was read: a document moved to the trash during its upload may be missing from this list.',
 };
 
 /**

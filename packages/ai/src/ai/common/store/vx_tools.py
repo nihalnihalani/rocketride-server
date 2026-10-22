@@ -671,15 +671,18 @@ _TRASH_PHASE = 'trash_live'
 #: Live chunks one read may return when telling which trashed documents still have one.
 _LIVE_READ_ROWS = 1000
 
-#: ``stats`` reads the trash of a store that counts by chunk 0 while it holds at most this
-#: many documents, in at most this many calls (contract section 4.5).
-_STATS_TRASH_READ_MAX = 1000
-_STATS_TRASH_READ_PAGES = 8
+#: How much of the trash is read for its documents with a live chunk: an Active listing asks
+#: for at most ``_TRASH_READ_MAX`` rows of the Trash listing in all, and ends with the caveat
+#: ``trash_scan_cut`` when that bound stops it; ``stats`` reads the trash only while it holds
+#: at most ``_TRASH_READ_MAX`` documents, in at most ``_TRASH_READ_PAGES`` calls (contract
+#: section 4.5).
+_TRASH_READ_MAX = 1000
+_TRASH_READ_PAGES = 8
 
 
-def _trash_phase_cursor(inner: Optional[str]) -> str:
-    """The cursor of the second phase of an Active listing, around the driver's trash cursor."""
-    return encodeCursor({_TRASH_PHASE_KEY: _TRASH_PHASE, 'c': inner})
+def _trash_phase_cursor(inner: Optional[str], read: int = 0) -> str:
+    """The cursor of the second phase of an Active listing: the driver's trash cursor and the trash documents read."""
+    return encodeCursor({_TRASH_PHASE_KEY: _TRASH_PHASE, 'c': inner, 'r': read})
 
 
 def _doc_list_filter_arg(args: Mapping[str, Any]) -> Optional[DocListFilter]:
@@ -1404,16 +1407,25 @@ class VectorExplorerTools:
     def _vx_count_live_in_trash(self, store: Any, trashed: int) -> Optional[int]:
         """The documents of the trash that still have a live chunk and no live chunk 0.
 
-        None (not counted) when the trash holds more than ``_STATS_TRASH_READ_MAX``
-        documents or the read does not end within a few pages.
+        None (not counted) when the trash holds more than ``_TRASH_READ_MAX`` documents or
+        the read does not end within ``_TRASH_READ_PAGES`` calls or is cut by its bound.
         """
-        if trashed > _STATS_TRASH_READ_MAX:
+        if trashed > _TRASH_READ_MAX:
             return None
-        found, cursor = 0, None
-        for _ in range(_STATS_TRASH_READ_PAGES):
-            _page, rows, cursor = self._vx_live_in_trash(
-                store, cursor, limit=LIMITS['documents_page'], object_ids=None, sort='path', hook_args={}, parent=None
+        found, cursor, read = 0, None, 0
+        for _ in range(_TRASH_READ_PAGES):
+            _page, rows, cursor, read, cut = self._vx_live_in_trash(
+                store,
+                cursor,
+                limit=LIMITS['documents_page'],
+                object_ids=None,
+                sort='path',
+                hook_args={},
+                parent=None,
+                read=read,
             )
+            if cut:
+                return None
             found += len(rows)
             if cursor is None:
                 return found
@@ -1585,7 +1597,7 @@ class VectorExplorerTools:
         if isinstance(args.get('deleted'), bool):
             args = {**args, 'deleted': 'deleted' if args['deleted'] else 'active'}
         cursor = args.get('cursor')
-        trash_phase = False
+        trash_phase, trash_read = False, 0
         if cursor is not None:
             if not isinstance(cursor, str):
                 raise invalidCursor()
@@ -1595,8 +1607,14 @@ class VectorExplorerTools:
                 raise invalidCursor() from None
             if state.get(_TRASH_PHASE_KEY) is not None:
                 # The second phase of an Active listing: the driver's own trash cursor inside.
-                inner = state.get('c')
-                if state[_TRASH_PHASE_KEY] != _TRASH_PHASE or (inner is not None and not isinstance(inner, str)):
+                inner, trash_read = state.get('c'), state.get('r', 0)
+                if (
+                    state[_TRASH_PHASE_KEY] != _TRASH_PHASE
+                    or (inner is not None and not isinstance(inner, str))
+                    or isinstance(trash_read, bool)
+                    or not isinstance(trash_read, int)
+                    or trash_read < 0
+                ):
                     raise invalidCursor()
                 trash_phase, cursor = True, inner
         limit = _clamped(
@@ -1622,9 +1640,10 @@ class VectorExplorerTools:
         hand_over = hook_filter is not None and filters
         hook_args: Dict[str, Any] = {'filter': hook_filter} if hand_over else {}
         listing = {'limit': limit, 'object_ids': object_ids, 'sort': sort, 'hook_args': hook_args, 'parent': parent}
+        scan_cut = False
         if trash_phase:
-            page, rows, inner_next = self._vx_live_in_trash(store, cursor, **listing)
-            next_cursor = _trash_phase_cursor(inner_next) if inner_next is not None else None
+            page, rows, inner_next, read, scan_cut = self._vx_live_in_trash(store, cursor, read=trash_read, **listing)
+            next_cursor = _trash_phase_cursor(inner_next, read) if inner_next is not None else None
             total = None
         else:
             page = store.listDocumentPage(
@@ -1637,24 +1656,32 @@ class VectorExplorerTools:
             ]
             next_cursor = page.next_cursor
             total = page.total if parent is None else None
+            by_first_chunk = deleted == 'active' and 'documents_by_first_chunk' in page.caveats
+            may_hold: Optional[bool] = None
+            if by_first_chunk and total is not None:
+                # The listing may go on into the trash, past what the driver's total counts.
+                may_hold = self._vx_trash_may_hold(store, object_ids)
+                if may_hold:
+                    total = None
             if (
-                deleted == 'active'
+                by_first_chunk
                 and next_cursor is None
-                and 'documents_by_first_chunk' in page.caveats
                 and 'documents_paging_unsupported' not in page.caveats
-                and self._vx_trash_may_hold(store, object_ids)
+                and (may_hold if may_hold is not None else self._vx_trash_may_hold(store, object_ids))
             ):
                 # The driver's last Active page: the trash may still hold documents with a live chunk.
                 # Room left on the page takes them from one page of the trash; a full page hands
                 # the trash on to the next call; an empty one reads on now, since a client takes
                 # an empty page for the end.
                 if len(rows) >= limit:
-                    next_cursor = _trash_phase_cursor(None)
+                    next_cursor = _trash_phase_cursor(None, 0)
                 else:
                     room = dict(listing, limit=limit - len(rows)) if rows else listing
-                    _trash_page, more, inner_next = self._vx_live_in_trash(store, None, single_page=bool(rows), **room)
+                    _trash_page, more, inner_next, read, scan_cut = self._vx_live_in_trash(
+                        store, None, single_page=bool(rows), **room
+                    )
                     rows = rows + more
-                    next_cursor = _trash_phase_cursor(inner_next) if inner_next is not None else None
+                    next_cursor = _trash_phase_cursor(inner_next, read) if inner_next is not None else None
         items = [
             {
                 'objectId': row.objectId,
@@ -1676,6 +1703,8 @@ class VectorExplorerTools:
             for row in rows
         ]
         caveats = list(page.caveats)
+        if scan_cut:
+            caveats.append('trash_scan_cut')
         if not page.sorted and 'documents_unsorted' not in caveats:
             caveats.append('documents_unsorted')
         answer: Dict[str, Any] = {
@@ -1721,8 +1750,9 @@ class VectorExplorerTools:
         hook_args: Mapping[str, Any],
         parent: Optional[str],
         single_page: bool = False,
-    ) -> Tuple[DocPage, List[DocumentRow], Optional[str]]:
-        """The documents of the trash that still have a live chunk, as Active rows: ``(page, rows, next)``.
+        read: int = 0,
+    ) -> Tuple[DocPage, List[DocumentRow], Optional[str], int, bool]:
+        """The documents of the trash that still have a live chunk, as Active rows: ``(page, rows, next, read, cut)``.
 
         Reads the driver's Trash listing from ``cursor`` (its own cursor), one page and one
         batched read of the page's live chunks at a time, until a page holds such a
@@ -1731,12 +1761,20 @@ class VectorExplorerTools:
         with a live chunk 0 is left out (the driver's Active pages list it). The rows say
         ``deleted: false`` and ``has_first_chunk: false``, and count the live chunks where
         one read held them all. ``next`` is the driver's cursor for the rest of the trash.
+
+        The bound: ``read`` counts the rows of the Trash listing the listing has asked for
+        so far, at most ``_TRASH_READ_MAX`` in all (the pages are cut to fit). When the bound
+        stops the read before the trash ends, ``next`` is None and ``cut`` is true.
         """
         passed = set()
         while True:
+            if read >= _TRASH_READ_MAX:
+                return DocPage([], None, None, False, False, False, []), [], None, read, True
+            asked = min(limit, _TRASH_READ_MAX - read)
             page = store.listDocumentPage(
-                cursor=cursor, limit=limit, object_ids=object_ids, deleted='deleted', sort=sort, **hook_args
+                cursor=cursor, limit=asked, object_ids=object_ids, deleted='deleted', sort=sort, **hook_args
             )
+            read += asked
             candidates = [
                 row
                 for row in page.items
@@ -1751,8 +1789,10 @@ class VectorExplorerTools:
             following = page.next_cursor
             if 'documents_paging_unsupported' in page.caveats or following == cursor or following in passed:
                 following = None
+            if following is not None and read >= _TRASH_READ_MAX:
+                return page, rows, None, read, True
             if rows or following is None or single_page:
-                return page, rows, following
+                return page, rows, following, read, False
             passed.add(following)
             cursor = following
 

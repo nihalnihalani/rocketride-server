@@ -51,7 +51,8 @@ from .test_vectordb_tool_mixin import node
 
 def test_the_new_capability_keys_and_caveats_are_appended_to_the_vocabularies():
     assert vx_types.CAPABILITY_KEYS[-3:] == ('clusters', 'documents_filter', 'recommend_best_score')
-    assert vx_types.CAVEATS[-3:] == ('listing_truncated', 'documents_filter_partial', 'documents_filter_client')
+    assert vx_types.CAVEATS[-4:-1] == ('listing_truncated', 'documents_filter_partial', 'documents_filter_client')
+    assert vx_types.CAVEATS[-1] == 'trash_scan_cut', 'the trash addendum (section 4.5) comes last'
     for vocabulary in (vx_types.CAPABILITY_KEYS, vx_types.CAVEATS):
         assert len(set(vocabulary)) == len(vocabulary)
 
