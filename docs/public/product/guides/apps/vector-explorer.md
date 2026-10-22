@@ -83,7 +83,7 @@ written by an earlier release, and **Experimental** otherwise.
   import json
 
   pipeline = json.load(open('postgres.pipe'))
-  pipeline['project_id'] = '…'   # one fixed id for this pipeline, e.g. a uuid4 you keep
+  pipeline['project_id'] = '…'  # one fixed id for this pipeline, e.g. a uuid4 you keep
   # client: a connected RocketRideClient
   for source in ('ingest_1', 'chat_1', 'tools_1'):
       result = await client.use(pipeline=pipeline, source=source, ttl=0, use_existing=True)

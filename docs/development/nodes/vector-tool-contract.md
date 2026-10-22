@@ -56,50 +56,86 @@ New files in `packages/ai/src/ai/common/store/`: `errors.py` (`StoreUnsupported`
 
 ```python
 Deleted = Literal['active', 'deleted', 'all']
-Key = Tuple[str, int]                       # (objectId, chunkId)
+Key = Tuple[str, int]  # (objectId, chunkId)
+
 
 @dataclass(frozen=True)
 class StoreInfo:
-    backend: str                            # 'pgvector'|'qdrant'|'chroma'|'milvus'|'weaviate'|'pinecone'|'astra'|'atlas'
+    backend: str  # 'pgvector'|'qdrant'|'chroma'|'milvus'|'weaviate'|'pinecone'|'astra'|'atlas'
     backend_version: Optional[str]
-    collection: Optional[str]               # collection/table name, never the database name; None when absent
+    collection: Optional[str]  # collection/table name, never the database name; None when absent
     collection_exists: bool
-    control_record: Optional[bool]          # None when the collection does not exist
-    meta_column: Optional[bool]             # pgvector only: False while the ALTER is pending; None elsewhere
-    metric: Optional[str]                   # 'cosine'|'l2'|'ip'|None
+    control_record: Optional[bool]  # None when the collection does not exist
+    meta_column: Optional[bool]  # pgvector only: False while the ALTER is pending; None elsewhere
+    metric: Optional[str]  # 'cosine'|'l2'|'ip'|None
     dimension: Optional[int]
     model: Optional[str]
     index: Optional[Dict[str, Any]]
     size_bytes: Optional[int]
     caveats: List[str]
 
+
 @dataclass(frozen=True)
 class DocumentRow:
-    objectId: str; path: str; chunks: Optional[int]; has_first_chunk: bool; deleted: bool
-    tables: Optional[int]; nodeId: Optional[str]; size: Optional[int]
-    modifyTime: Optional[int]; ingestedAt: Optional[str]; pointId: Optional[str]
+    objectId: str
+    path: str
+    chunks: Optional[int]
+    has_first_chunk: bool
+    deleted: bool
+    tables: Optional[int]
+    nodeId: Optional[str]
+    size: Optional[int]
+    modifyTime: Optional[int]
+    ingestedAt: Optional[str]
+    pointId: Optional[str]
+
 
 @dataclass(frozen=True)
 class DocPage:
-    items: List[DocumentRow]; next_cursor: Optional[str]; total: Optional[int]
-    counts_exact: bool; distinct: bool; sorted: bool; caveats: List[str]
-    filter_ignored: Tuple[str, ...] = ()    # §4.4-A: the given filter keys the hook did not apply
+    items: List[DocumentRow]
+    next_cursor: Optional[str]
+    total: Optional[int]
+    counts_exact: bool
+    distinct: bool
+    sorted: bool
+    caveats: List[str]
+    filter_ignored: Tuple[str, ...] = ()  # §4.4-A: the given filter keys the hook did not apply
+
 
 @dataclass(frozen=True)
 class ChunkPage:
-    docs: List[Doc]; has_more: bool; next_after: int          # docs never carry embeddings
+    docs: List[Doc]
+    has_more: bool
+    next_after: int  # docs never carry embeddings
+
 
 @dataclass(frozen=True)
 class KnnGraph:
-    k: int; offsets_row: np.ndarray; cols: np.ndarray; sims: np.ndarray; source: str   # 'native'|'node'
+    k: int
+    offsets_row: np.ndarray
+    cols: np.ndarray
+    sims: np.ndarray
+    source: str  # 'native'|'node'
+
 
 @dataclass(frozen=True)
-class DocListFilter:                        # the `documents` filter (§4.4-A); every field Optional, None = not filtered
-    path_prefix: str; file_types: Tuple[str, ...]; ingested_after: str; ingested_before: str
-    min_chunks: int; max_chunks: int; has_first_chunk: bool; has_tables: bool; path_contains: str
+# the `list_documents` filter (§4.4-A); every field Optional, None = not filtered
+class DocListFilter:
+    path_prefix: str
+    file_types: Tuple[str, ...]
+    ingested_after: str
+    ingested_before: str
+    min_chunks: int
+    max_chunks: int
+    has_first_chunk: bool
+    has_tables: bool
+    path_contains: str
+
     def given(self) -> Tuple[str, ...]: ...  # the keys it sets, in DOC_LIST_FILTER_KEYS order
 
-def parse_doc_list_filter(value) -> Optional[DocListFilter]: ...   # ValueError(sentence) -> INVALID_INPUT; None when it sets nothing
+
+# ValueError(sentence) -> INVALID_INPUT; None when it sets nothing
+def parse_doc_list_filter(value) -> Optional[DocListFilter]: ...
 ```
 
 `parse_doc_list_filter` refuses: a filter that is not an object, an unknown key, text that is not text or is longer than 1,024 characters (`DOC_LIST_FILTER_TEXT_MAX`), a date not in ISO-8601's extended form, a chunk count that is not a whole number of 0 or more, `min_chunks > max_chunks`, a flag that is not a boolean, more than 32 `file_types` (`DOC_LIST_FILTER_TYPES_MAX`) or one that is not an extension. It normalises dates to UTC `YYYY-MM-DDTHH:MM:SSZ` (the stored `ingestedAt` form, so the bounds compare as text; no offset means UTC) and extensions to lower case without the dot; an empty text or list is the same as leaving the key out. The value lists of the additive answers are constants beside the vocabularies: `FILTER_APPLIED_VALUES`, `LISTING_REASONS`, `CLUSTER_METHODS`, `CLUSTER_LABEL_SOURCES`, `RECOMMEND_STRATEGIES`, `MATRIX_SOURCES`, `KEYWORD_MATCHES`.
@@ -111,17 +147,19 @@ class DocumentStoreBase(ABC):
     # existing abstract API unchanged: count_documents, searchKeyword, searchSemantic, get, getPaths, addChunks, remove, markDeleted, markActive, render
     # except that markDeleted / markActive return Optional[int]: the chunks moved into / out of the trash (§4.5), or None
 
-    def capabilities(self) -> FrozenSet[str]: ...   # introspection (type(self).hook is not DocumentStoreBase.hook) plus driver constants
+    # introspection (type(self).hook is not DocumentStoreBase.hook) plus driver constants
+    def capabilities(self) -> FrozenSet[str]: ...
 
     # Default: control record via doesCollectionExist() (ds:429-442), configured similarity; version/index/size None. Never raises for a missing collection.
     def describe(self) -> StoreInfo: ...
-    def scoreInfo(self) -> Dict[str, Any]: ...      # default {'formula':'unknown','higher_is_better':True,'floor':0.2,'threshold':self.threshold_search}
+    # default {'formula':'unknown','higher_is_better':True,'floor':0.2,'threshold':self.threshold_search}
+    def scoreInfo(self) -> Dict[str, Any]: ...
 
     # docFilter.minScore when set (may be -inf), else the driver's legacy floor. Agents never set minScore: unchanged results.
     def effectiveFloor(self, docFilter: DocFilter) -> float: ...
 
-    def countChunks(self, docFilter: DocFilter) -> Optional[int]: ...      # default None
-    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]: ...   # distinct objectIds; default None
+    def countChunks(self, docFilter: DocFilter) -> Optional[int]: ...  # default None
+    def countDocumentsWhere(self, docFilter: DocFilter) -> Optional[int]: ...  # distinct objectIds; default None
 
     # Default (distinct=False, sorted=False): get(DocFilter(chunkIds=[0], deleted=deleted, limit=limit+1, offset=cursor.offset)),
     # sorted by (parent, objectId) within the page; chunks=None; counts_exact=False; total=None.
@@ -131,7 +169,16 @@ class DocumentStoreBase(ABC):
     # INVALID_INPUT 'cursor must be the next_cursor of a previous page.'); invalidCursor and defaultCursorState are
     # exported by document_store. A plain ValueError from the hook stays STORE_ERROR.
     # §4.4-A: `filter` is handed over only when the driver declares documents_filter; the default applies no key and names every given one in filter_ignored.
-    def listDocumentPage(self, *, cursor: Optional[str], limit: int, object_ids: Optional[Sequence[str]], deleted: Deleted, sort: str, filter: Optional[DocListFilter] = None) -> DocPage: ...
+    def listDocumentPage(
+        self,
+        *,
+        cursor: Optional[str],
+        limit: int,
+        object_ids: Optional[Sequence[str]],
+        deleted: Deleted,
+        sort: str,
+        filter: Optional[DocListFilter] = None,
+    ) -> DocPage: ...
 
     # Default: get(DocFilter(objectIds=[objectId], minChunkId=after_chunk+1, maxChunkId=after_chunk+limit, deleted=deleted)) sorted by chunkId.
     def scrollChunks(self, objectId: str, *, after_chunk: int, limit: int, deleted: Deleted) -> ChunkPage: ...
@@ -139,7 +186,9 @@ class DocumentStoreBase(ABC):
     # (docs WITH embeddings, strategy_used in {'random','stratified','first'}). strategy='stratified' is native where cheap
     # (pgvector ROW_NUMBER() OVER (PARTITION BY objectid ORDER BY random()); Atlas $sample per $group) and otherwise raises
     # StoreUnsupported so the base sampler falls back (§2.4). Default: raise StoreUnsupported.
-    def sampleChunks(self, *, n: int, seed: int, strategy: str, docFilter: DocFilter, include_keys: Sequence[Key]) -> Tuple[List[Doc], str]: ...
+    def sampleChunks(
+        self, *, n: int, seed: int, strategy: str, docFilter: DocFilter, include_keys: Sequence[Key]
+    ) -> Tuple[List[Doc], str]: ...
 
     # Vectors by key, BY FILTER (objectId IN ... AND chunkId IN ..., paired client-side, deleted='all'). A driver with deterministic
     # ids may try retrieve/get/fetch(ids=[uuid5(NAMESPACE_URL, f'{objectId}#{chunkId}')]) first and MUST fall back to the filter
@@ -154,7 +203,8 @@ class DocumentStoreBase(ABC):
     def removeCounted(self, objectIds: List[str]) -> Optional[int]: ...
 
     @staticmethod
-    def resolveDeleted(docFilter: DocFilter) -> Deleted: ...   # docFilter.deleted if set, else isDeleted None/False -> 'active', True -> 'all'
+    # docFilter.deleted if set, else isDeleted None/False -> 'active', True -> 'all'
+    def resolveDeleted(docFilter: DocFilter) -> Deleted: ...
 ```
 
 The listing and count hooks are named `listDocumentPage` and `countDocumentsWhere`. The names `listDocuments` and `countDocuments` belong to the agent tools' simple document listing (PR #2704: `listDocuments(parent, offset, limit, deleted)` and `countDocuments(parent, deleted)`), so no explorer class defines them; `nodes/test/test_vector_hook_names.py` pins this.
@@ -433,12 +483,16 @@ Two `StoreGlobalBase` switches decide which tools a store node offers at all, be
 ```python
 @dataclass(frozen=True)
 class ToolCallContext:
-    origin: str                 # 'dap' | 'agent'
+    origin: str  # 'dap' | 'agent'
     source_type: Optional[str]  # provider of the calling task's source; None when unknown
     targeted: bool
-    caller: Dict[str, Any]      # {'auth': 'public'|'task'|'account'|'agent'|'unknown', 'userId', 'teamId', 'orgId'}
+    caller: Dict[str, Any]  # {'auth': 'public'|'task'|'account'|'agent'|'unknown', 'userId', 'teamId', 'orgId'}
 
-TOOL_CONTEXT_FIELD = '__tool_context__'    # name of the plain instance attribute stamp_param() sets on the engine-built param
+
+# name of the plain instance attribute stamp_param() sets on the engine-built param
+TOOL_CONTEXT_FIELD = '__tool_context__'
+
+
 def current_tool_call() -> Optional[ToolCallContext]: ...
 @contextmanager
 def tool_call(ctx: ToolCallContext): ...
