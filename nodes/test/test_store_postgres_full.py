@@ -1105,7 +1105,7 @@ class TestDocumentsFilter:
         rng = np.random.default_rng(74)
         store = _open(dsn, table, stores)
         _ingest_library(store, rng)
-        answer = node(store).documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['md']}})
+        answer = node(store).list_documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['md']}})
         assert answer['success'] is True
         assert {item['objectId'] for item in answer['items']} == {'falcon', 'orphan'}
         assert (answer['filter_applied'], answer['filter_ignored'], answer['total']) == ('server', [], 2)
@@ -1367,7 +1367,7 @@ class TestLegacy:
             assert page.filter_ignored == ('ingested_after',)
             from .test_vectordb_tool_mixin import node
 
-            answer = node(store).documents({'filter': {'ingested_before': '2026-10-01', 'has_first_chunk': True}})
+            answer = node(store).list_documents({'filter': {'ingested_before': '2026-10-01', 'has_first_chunk': True}})
             assert (answer['filter_applied'], answer['filter_ignored']) == ('partial', ['ingested_before'])
             assert [item['objectId'] for item in answer['items']] == ['whole']
             assert 'documents_filter_partial' in answer['caveats']

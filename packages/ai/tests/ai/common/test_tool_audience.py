@@ -6,10 +6,15 @@ calls). ``tool.query`` lists only agent-audience tools; ``tool.invoke``
 dispatches every ``@tool_function`` regardless of audience.
 
 The vector store tools are the reason: Vector Explorer adds DAP-only tools to
-every store node, and an agent must keep seeing exactly the six tools it sees
-today, with byte-identical descriptors, the same accepted inputs and the same
-output keys. ``fixtures/vector_store_agent_descriptors.json`` is that catalog
-as the base revision builds it.
+every store node, and an agent must keep seeing develop's six tools (search,
+upsert, delete, objdir, get, stats) with byte-identical descriptors, the same
+accepted inputs and the same output keys. The agent catalog also lists the three
+tools #2704 adds and the Vector Explorer shares with it, under #2704's names:
+``list_documents``, ``soft_delete`` and ``restore`` (their descriptors are the
+port's: cursor-paged listing, trash writes with ``matched_chunks``).
+``fixtures/vector_store_agent_descriptors.json`` is that catalog of nine: its six
+develop entries are what base 3dec66821 (develop 87f530f39) builds, byte for byte,
+and its three new entries are this branch's.
 
 These run in the engine's Python (``./engine -m pytest``) because they drive the
 real ``rocketlib`` dispatcher and the real store mixin.
@@ -32,7 +37,8 @@ from ai.common.store import DocumentStoreBase, VectorStoreToolMixin
 from ai.common.tool_context import TOOL_CONTEXT_FIELD, agent_context, current_tool_call
 
 GOLDEN = Path(__file__).parent / 'fixtures' / 'vector_store_agent_descriptors.json'
-LEGACY_TOOLS = ['delete', 'get', 'objdir', 'search', 'stats', 'upsert']
+#: The agent catalog in tool.query order: develop's six (delete, get, objdir, search, stats, upsert) plus #2704's three.
+AGENT_TOOLS = ['delete', 'get', 'list_documents', 'objdir', 'restore', 'search', 'soft_delete', 'stats', 'upsert']
 
 # ---------------------------------------------------------------------------
 # The decorator
@@ -309,10 +315,10 @@ def _agent(node: IInstanceBase, tool: str, input_obj: Any) -> Any:
     return _invoke(node, tool, input_obj, stamp=agent_context())
 
 
-def test_store_agent_catalog_is_byte_identical_to_the_base_revision():
-    """tool.query on a store node lists the same six tools with byte-identical descriptors."""
+def test_store_agent_catalog_is_byte_identical_to_the_golden():
+    """tool.query on a store node lists develop's six tools, byte-identical, and #2704's three."""
     catalog = _query(_store_node())
-    assert [d['name'] for d in catalog] == LEGACY_TOOLS
+    assert [d['name'] for d in catalog] == AGENT_TOOLS
     assert json.dumps(catalog, sort_keys=True, indent=1) + '\n' == GOLDEN.read_text(encoding='utf-8')
 
 
@@ -329,7 +335,7 @@ def test_store_agent_catalog_through_the_agent_host_is_unchanged():
     )
     tools = AgentHostServices.Tools(invoker)
     golden = json.loads(GOLDEN.read_text(encoding='utf-8'))
-    assert [d['name'] for d in tools.list] == [f'store_1.{name}' for name in LEGACY_TOOLS]
+    assert [d['name'] for d in tools.list] == [f'store_1.{name}' for name in AGENT_TOOLS]
     assert [{**d, 'name': d['name'].split('.', 1)[1]} for d in tools.list] == golden
 
 

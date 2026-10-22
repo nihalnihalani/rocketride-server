@@ -69,11 +69,16 @@ _COLUMN_PER_KEY_MODULES = frozenset({'store_postgres', 'rocketride_vector'})
 _SCROLL_SLIDES_MAX = 64
 
 #: Driver methods that change stored rows; ``DocumentStoreBase.__init_subclass__`` guards them.
-_VX_GUARDED_WRITES = ('addChunks', 'remove', 'markDeleted', 'markActive')
+_VX_GUARDED_WRITES = ('addChunks', 'remove', 'removeCounted', 'markDeleted', 'markActive')
 
 
 def _guarded_write(name: str, method: Callable) -> Callable:
-    """Wrap a driver write method: extras trimmed for ``addChunks``, cached counts dropped afterwards."""
+    """Wrap a driver write method: extras trimmed for ``addChunks``, cached counts dropped afterwards.
+
+    A removal or a trash write also drops the cached samples, so ``project``, ``neighbors``
+    and ``similarity_matrix`` never serve a point that left the collection or went to the
+    trash; an upload keeps them (the points they hold are still stored and live).
+    """
     if name == 'addChunks':
 
         @functools.wraps(method)
@@ -91,6 +96,7 @@ def _guarded_write(name: str, method: Callable) -> Callable:
                 return method(self, *args, **kw)
             finally:
                 self.vxForgetCounts()
+                self.vxForgetSamples()
 
     guarded.__vx_write_guard__ = True
     return guarded
@@ -302,9 +308,10 @@ class DocumentStoreBase(ABC):
 
         ``addChunks`` goes through :meth:`vxWritableChunks`, so a driver that cannot store
         the explorer's metadata extras keeps ingesting exactly what it wrote before; it and
-        ``remove``, ``markDeleted`` and ``markActive`` then drop the cached ``stats``
-        figures (:meth:`vxForgetCounts`), whether they succeed or fail. Covers every path to
-        the driver: ``writeDocuments`` (the data lane), nodes that call the store directly,
+        ``remove``, ``removeCounted``, ``markDeleted`` and ``markActive`` then drop the cached
+        ``stats`` figures (:meth:`vxForgetCounts`), whether they succeed or fail, and all but
+        ``addChunks`` drop the cached samples too (:meth:`vxForgetSamples`). Covers every path
+        to the driver: ``writeDocuments`` (the data lane), nodes that call the store directly,
         ``createCollection`` and the tools.
         """
         super().__init_subclass__(**kwargs)
@@ -321,6 +328,12 @@ class DocumentStoreBase(ABC):
         state = self.__dict__.get('_vx_state')
         if state is not None:
             state.forget_counts()
+
+    def vxForgetSamples(self) -> None:
+        """Drop the samples cached for this store (after a removal or a trash write)."""
+        state = self.__dict__.get('_vx_state')
+        if state is not None:
+            state.forget_samples()
 
     def vxChunksInState(self, objectIds: Sequence[str], deleted: bool) -> Optional[int]:
         """Count the chunks of ``objectIds`` in the trash (``deleted``) or out of it, through :meth:`countChunks`.
@@ -1257,7 +1270,7 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     writes the team's tenant database) defaults it to off, because ``objdir``
     and ``get`` together return the whole table to any caller of the
     pipeline's tool path. ``allow_write`` then decides whether the write tools
-    (``upsert``, ``delete`` and ``remove_document``) are among them. While a
+    (``upsert``, ``delete``, ``soft_delete`` and ``restore``) are among them. While a
     switch is off the affected tools are left out of ``_collect_tool_methods``,
     so the engine neither lists nor dispatches them (an invoke fails as a tool
     the node has no handler for); :meth:`_vectordb_surface_refusal`, which the
@@ -1910,7 +1923,13 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
     )
     @vectordb_tool
     def delete(self, args):
-        """Delete documents from the vector database by object IDs (gated; see ``vx_write_gate``)."""
+        """Delete documents from the vector database by object IDs (gated; see ``vx_write_gate``).
+
+        The only permanent delete. With ``deleted_only`` (the Vector Explorer's "Empty
+        trash") a document is removed only when every chunk of it is in the trash; one
+        that still has a live chunk (a later ingest batch added it) is left whole and named
+        in ``kept_live``.
+        """
         store = self._vectordb_store()
 
         # The gate runs first (on the ids as sent), then the input is checked.
@@ -1929,16 +1948,140 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             raise ToolRefusal(
                 'INVALID_INPUT', f'object_ids must be a list of 1 to {VECTOR_TOOL_LIMITS["write_ids_max"]} strings.'
             )
+        deleted_only = args.get('deleted_only', False)
+        if deleted_only is None:
+            deleted_only = False
+        if not isinstance(deleted_only, bool):
+            raise ToolRefusal('INVALID_INPUT', 'deleted_only must be true or false.')
         unique_ids = list(dict.fromkeys(clean_ids))
-        _removed, not_found, rows = self._vx_remove(store, unique_ids)
-        self._vx_log_write('vector.delete', unique_ids, rows, decision.origin)
+        kept_live = [oid for oid in unique_ids if self._vx_has_live_chunk(store, oid)] if deleted_only else []
+        targets = [oid for oid in unique_ids if oid not in kept_live]
+        not_found: List[str] = []
+        rows: Optional[int] = 0
+        if targets:
+            _removed, not_found, rows = self._vx_remove(store, targets)
+        self._vx_log_write('vector.delete', targets, rows, decision.origin)
         return {
             'success': True,
             'deleted_count': len(clean_ids),
             'removed_chunks': rows,
             'not_found': not_found,
-            'audit': self._vx_audit('vector.delete', store, unique_ids, rows, decision),
+            'kept_live': kept_live,
+            'audit': self._vx_audit('vector.delete', store, targets, rows, decision),
         }
+
+    # --- The trash and the document listing (#2704's names, the explorer's shapes) --------------
+    #
+    # Defined here, on the class #2704 edits, not on a mixin: a merge of #2704 then meets
+    # them as a textual conflict or a duplicate method of this one class, never as a method
+    # of another class in the MRO that this one would silently shadow
+    # (nodes/test/test_vector_tool_set.py holds every tool to one owner).
+
+    @tool_function(
+        input_schema=VectorExplorerTools.LIST_DOCUMENTS_INPUT,
+        output_schema=VectorExplorerTools.LIST_DOCUMENTS_OUTPUT,
+        description=(
+            'List the documents in this vector database one by one (equal paths are not collapsed), each with '
+            'its path and chunk count, in pages ordered by path. Follow next_cursor for the next page. '
+            "deleted='deleted' (or true) lists the trash; parent keeps one exact path."
+        ),
+    )
+    @vectordb_tool
+    def list_documents(self, args):
+        """One page of the document directory (see ``VectorExplorerTools._vx_list_documents``)."""
+        return self._vx_list_documents(args)
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs of the documents to move to the trash.',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'The distinct object IDs the request named, in the order given.',
+                },
+                'matched_chunks': {
+                    'type': ['integer', 'null'],
+                    'description': (
+                        'Chunks the call moved to the trash (0 for documents already there), or null when the '
+                        'store does not count.'
+                    ),
+                },
+                'not_found': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs with nothing stored.',
+                },
+                'audit': {'type': 'object'},
+            },
+        },
+        description=(
+            'Move documents to the trash by object ID: their chunks stay stored but leave search, objdir, get '
+            'and the active listing until restore. delete removes them for good instead.'
+        ),
+    )
+    @vectordb_tool
+    def soft_delete(self, args):
+        """Move documents to the trash (gated; see ``VectorExplorerTools._vx_trash_write``)."""
+        return self._vx_trash_write('soft_delete', args, deleted=True)
+
+    @tool_function(
+        input_schema={
+            'type': 'object',
+            'required': ['object_ids'],
+            'properties': {
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs of the documents to take out of the trash.',
+                },
+            },
+        },
+        output_schema={
+            'type': 'object',
+            'properties': {
+                'success': {'type': 'boolean'},
+                'object_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'The distinct object IDs the request named, in the order given.',
+                },
+                'matched_chunks': {
+                    'type': ['integer', 'null'],
+                    'description': (
+                        'Chunks the call took out of the trash (0 for documents not in it), or null when the '
+                        'store does not count.'
+                    ),
+                },
+                'not_found': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'description': 'Object IDs with nothing stored.',
+                },
+                'audit': {'type': 'object'},
+            },
+        },
+        description=(
+            'Take documents out of the trash by object ID, so their chunks are searchable and readable again. '
+            'A document not in the trash is left as it is; one removed with delete cannot be restored.'
+        ),
+    )
+    @vectordb_tool
+    def restore(self, args):
+        """Take documents out of the trash (gated; see ``VectorExplorerTools._vx_trash_write``)."""
+        return self._vx_trash_write('restore', args, deleted=False)
 
     @tool_function(
         input_schema={
@@ -2167,6 +2310,9 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             isDeleted=False,
         )
         docs = store.get(doc_filter)
+        if not docs and self._vx_in_trash(store, object_id):
+            # No live chunk: every chunk of it is in the trash (an unknown id stays an empty page).
+            raise self._vx_in_trash_refusal('get', object_id)
 
         chunks = [
             {

@@ -50,8 +50,8 @@ unmocked:
    the suite then only adds and removes documents of its own there.
 4. Every explorer tool is called by name through ``client.tool`` on the
    template's node ids, on the new and the legacy collection: dialect, stats,
-   documents, chunks, vectors, sample, project, neighbors, search,
-   remove_document, the legacy get/objdir/delete/upsert, and ``embed`` on
+   list_documents, chunks, vectors, sample, project, neighbors, search,
+   soft_delete/restore (the trash), the legacy get/objdir/delete/upsert, and ``embed`` on
    ``embed_1``; and the additive surface of contract section 4.4: the
    documents filter and its ``filter_applied`` (server on pgvector, partial on
    the legacy table for ingest dates; also through the pooler), the health
@@ -70,7 +70,7 @@ unmocked:
 5. A chat through ``chat_1`` returns the stub's answer and the retrieved chunks;
    a pipeline shaped like the repository's RAG example (webhook and chat, no
    Tools source) answers ``dialect``/``stats`` through its chat token and
-   refuses ``remove_document`` with ``WRITES_SOURCE``; ``rocketride_vector.pipe``
+   refuses ``delete`` with ``WRITES_SOURCE``; ``rocketride_vector.pipe``
    runs again with the broker answering the transaction-mode pooler's DSN
    (``RR_TEST_PGVECTOR_POOLER_DSN``) and a search filtered to one document
    still returns ``k`` rows.
@@ -1154,7 +1154,7 @@ def test_dialect_describes_the_store(side, deployment):
     # allow_write (the outer gate) alone decides agent writes: the answer names no agent switch.
     assert d['allow_writes'] is True and 'agent_writes' not in d
     assert d['writes_scope'] == 'tools_source'
-    assert set(d['write_tools']) == {'remove_document', 'delete', 'upsert'}
+    assert set(d['write_tools']) == {'upsert', 'delete', 'soft_delete', 'restore'}
     # embed_node is the one capability the app fills in (CONTRACT section 4.1); the node reports the rest.
     assert set(vx_types.CAPABILITY_KEYS) - {'embed_node'} <= set(d['capabilities'])
     assert 'embed_node' not in d['capabilities']
@@ -1195,7 +1195,7 @@ def test_stats_full_and_quick(side, deployment):
 def _all_documents(side_: _Side, limit: int = 3) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     items, cursor, last = [], None, {}
     for _ in range(100):
-        last = side_.ok('documents', {'cursor': cursor, 'limit': limit, 'deleted': 'active', 'sort': 'path'})
+        last = side_.ok('list_documents', {'cursor': cursor, 'limit': limit, 'deleted': 'active', 'sort': 'path'})
         items += last['items']
         cursor = last['next_cursor']
         if cursor is None:
@@ -1432,7 +1432,9 @@ def test_the_documents_filter_says_how_much_the_store_applied(side, deployment):
     items, _ = _all_documents(side)
     prefix = next(i['path'] for i in items if i['objectId'] == side.multi).rsplit('/', 1)[0] + '/'
     want = {i['objectId'] for i in items if i['path'].startswith(prefix)}
-    page = side.ok('documents', {'limit': 200, 'deleted': 'active', 'sort': 'path', 'filter': {'path_prefix': prefix}})
+    page = side.ok(
+        'list_documents', {'limit': 200, 'deleted': 'active', 'sort': 'path', 'filter': {'path_prefix': prefix}}
+    )
     applied, ignored = page['filter_applied'], page['filter_ignored']
     got = {i['objectId'] for i in page['items']}
     if deployment.provider in ('postgres', 'rocketride_vector'):
@@ -1447,7 +1449,7 @@ def test_the_documents_filter_says_how_much_the_store_applied(side, deployment):
         assert want <= got, 'a store that did not filter must still list the documents'
     # The ingest time lives in the meta column, which the legacy pgvector table does not have.
     dated = side.ok(
-        'documents',
+        'list_documents',
         {
             'limit': 200,
             'deleted': 'active',
@@ -1464,7 +1466,7 @@ def test_the_documents_filter_says_how_much_the_store_applied(side, deployment):
         {'min_chunks': 5, 'max_chunks': 2},
         {'path_prefix': 'x' * 1025},
     ):
-        assert side.refused('documents', {'limit': 10, 'filter': bad}) == 'INVALID_INPUT', bad
+        assert side.refused('list_documents', {'limit': 10, 'filter': bad}) == 'INVALID_INPUT', bad
 
 
 @pytest.mark.skipif(bool(_NEEDS_DOCUMENTS), reason=_NEEDS_DOCUMENTS or '')
@@ -1590,19 +1592,46 @@ def _own_document(side_: _Side, label: str, tmp_dir: Path) -> Tuple[str, str]:
     return name, object_id(name)
 
 
-def test_remove_document_removes_exactly_that_documents_rows(side, deployment, tmp_path):
+def test_delete_removes_exactly_that_documents_rows(side, deployment, tmp_path):
     name, oid = _own_document(side, 'remove', tmp_path)
     before = deployment.service.counts(side.collection)
-    out = side.ok('remove_document', {'object_ids': [oid, 'no-such-document']})
-    assert out['removed'] == [{'objectId': oid, 'chunks_removed': before[oid]}]
-    assert out['removed_chunks'] == before[oid] and out['not_found'] == ['no-such-document']
+    out = side.ok('delete', {'object_ids': [oid, 'no-such-document']})
+    assert out['removed_chunks'] == before[oid] and out['not_found'] == ['no-such-document'] and out['kept_live'] == []
     audit = out['audit']
-    assert audit['action'] == 'vector.remove_document' and audit['node'] == 'store_1'
+    assert audit['action'] == 'vector.delete' and audit['node'] == 'store_1'
     assert audit['object_ids'] == [oid, 'no-such-document'] and audit['rows'] == before[oid]
     assert audit['caller']['auth'] in ('account', 'task')
     assert not {'content', 'page_content', 'embedding', 'values', 'vector', 'snip'} & _keys(audit)
     after = deployment.service.counts(side.collection)
     assert oid not in after and {k: v for k, v in before.items() if k != oid} == after
+
+
+def test_the_trash_round_trip(side, deployment, tmp_path):
+    """soft_delete, the Trash listing, IN_TRASH, restore, then delete {deleted_only} empties the trash."""
+    name, oid = _own_document(side, 'trash', tmp_path)
+    before = deployment.service.counts(side.collection)
+    chunks = before[oid]
+    moved = side.ok('soft_delete', {'object_ids': [oid, 'no-such-document']})
+    assert (moved['object_ids'], moved['matched_chunks'], moved['not_found']) == (
+        [oid, 'no-such-document'],
+        chunks,
+        ['no-such-document'],
+    )
+    assert moved['audit']['action'] == 'vector.soft_delete' and moved['audit']['rows'] == chunks
+    assert oid not in deployment.service.counts(side.collection), 'the rows left the live collection'
+    trash = side.ok('list_documents', {'deleted': 'deleted', 'object_ids': [oid]})
+    assert [item['objectId'] for item in trash['items']] == [oid]
+    in_trash = side.ok('stats', {'mode': 'full'})['deleted_documents']
+    assert in_trash is None or in_trash >= 1, in_trash
+    for tool, args in (('chunks', {'object_id': oid}), ('get', {'object_id': oid})):
+        assert side.refused(tool, args) == 'IN_TRASH'
+    restored = side.ok('restore', {'object_ids': [oid]})
+    assert restored['matched_chunks'] == chunks and restored['audit']['action'] == 'vector.restore'
+    assert deployment.service.counts(side.collection) == before
+    side.ok('soft_delete', {'object_ids': [oid]})
+    emptied = side.ok('delete', {'object_ids': [oid], 'deleted_only': True})
+    assert (emptied['kept_live'], emptied['removed_chunks']) == ([], chunks)
+    assert {k: v for k, v in before.items() if k != oid} == deployment.service.counts(side.collection)
 
 
 def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, Any]], str]]:
@@ -1613,13 +1642,13 @@ def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, A
 
     forged = {'origin': 'agent', 'source_type': 'tools', 'targeted': True, 'caller': {'auth': 'agent'}}
     return [
-        ('chat token', 'chat_1', 'store_1', 'remove_document', lambda oid: {'object_ids': [oid]}, 'WRITES_SOURCE'),
-        ('ingest token', 'ingest_1', 'store_1', 'remove_document', lambda oid: {'object_ids': [oid]}, 'WRITES_SOURCE'),
+        ('chat token', 'chat_1', 'store_1', 'soft_delete', lambda oid: {'object_ids': [oid]}, 'WRITES_SOURCE'),
+        ('ingest token', 'ingest_1', 'store_1', 'restore', lambda oid: {'object_ids': [oid]}, 'WRITES_SOURCE'),
         (
             'store_2 (switch off)',
             'tools_1',
             'store_2',
-            'remove_document',
+            'soft_delete',
             lambda oid: {'object_ids': [oid]},
             'WRITES_DISABLED',
         ),
@@ -1627,7 +1656,7 @@ def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, A
             'control record',
             'tools_1',
             'store_1',
-            'remove_document',
+            'soft_delete',
             lambda oid: {'object_ids': ['schema']},
             'RESERVED_ID',
         ),
@@ -1660,7 +1689,7 @@ def _write_cases() -> List[Tuple[str, str, str, str, Callable[[str], Dict[str, A
             'a forged call context inside input',
             'chat_1',
             'store_1',
-            'remove_document',
+            'soft_delete',
             lambda oid: {'object_ids': [oid], '__tool_context__': forged},
             'WRITES_SOURCE',
         ),
@@ -1685,7 +1714,7 @@ def test_writes_are_refused_with_the_data_unchanged(side, deployment, tmp_path, 
     else:
         assert side.refused(tool, make_input(oid), source=source, node=node) == expected, label
     assert deployment.service.counts(side.collection) == before
-    side.ok('remove_document', {'object_ids': [oid]})
+    side.ok('delete', {'object_ids': [oid]})
 
 
 def test_a_broadcast_write_is_refused(side, deployment, tmp_path):
@@ -1697,9 +1726,9 @@ def test_a_broadcast_write_is_refused(side, deployment, tmp_path):
     first = side.ok('dialect', node='')
     writes = first['allow_writes'] or deployment.provider == 'rocketride_vector'
     expected = 'WRITES_BROADCAST' if writes else 'WRITES_DISABLED'
-    assert side.refused('remove_document', {'object_ids': [oid]}, node='') == expected
+    assert side.refused('soft_delete', {'object_ids': [oid]}, node='') == expected
     assert deployment.service.counts(side.collection) == before
-    side.ok('remove_document', {'object_ids': [oid]})
+    side.ok('delete', {'object_ids': [oid]})
 
 
 def test_the_write_switch_default_is_the_shared_constant(deployment):
@@ -1722,7 +1751,7 @@ def test_the_write_switch_default_is_the_shared_constant(deployment):
             pytest.skip(
                 'NOT RUN: VECTOR_ALLOW_WRITES_DEFAULT is on, so the refusal row does not apply (the allowed path is covered above)'
             )
-        assert variant.refused('remove_document', {'object_ids': [oid]}) == 'WRITES_DISABLED'
+        assert variant.refused('soft_delete', {'object_ids': [oid]}) == 'WRITES_DISABLED'
         assert deployment.service.counts(deployment.new.collection) == before
     finally:
         variant.stop()
@@ -1847,9 +1876,7 @@ def test_a_pipeline_without_a_tools_source_is_read_only(engine, stub, corpus_fil
         assert side_.ok('dialect', source='chat_1', node='store_2')['provider'] == 'postgres'
         assert side_.ok('stats', source='chat_1', node='store_2')['documents'] == 1
         before = service.counts(collection)
-        assert (
-            side_.refused('remove_document', {'object_ids': [oid]}, source='chat_1', node='store_2') == 'WRITES_SOURCE'
-        )
+        assert side_.refused('delete', {'object_ids': [oid]}, source='chat_1', node='store_2') == 'WRITES_SOURCE'
         assert service.counts(collection) == before
         # The ingest-side store is not on the chat source's path at all.
         with pytest.raises(CommandException, match='not found in pipeline'):
@@ -1883,7 +1910,7 @@ def test_rocketride_vector_through_the_transaction_pooler(engine, broker, stub, 
         if not _NEEDS_DOCUMENTS:
             # The documents filter runs in the statement that pages the keys, through the pooler too.
             prefix = stored_path(UPLOAD_PREFIX) + 'handbooks/'
-            page = pooled.ok('documents', {'limit': 200, 'deleted': 'active', 'filter': {'path_prefix': prefix}})
+            page = pooled.ok('list_documents', {'limit': 200, 'deleted': 'active', 'filter': {'path_prefix': prefix}})
             assert page['filter_applied'] == 'server' and {i['objectId'] for i in page['items']} == {oid}, page
     finally:
         pooled.stop()

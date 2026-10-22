@@ -806,7 +806,7 @@ class TestRocketrideVectorNode:
             self._seed(rv, glb, rng)
             offered = set(inst._collect_tool_methods())
             assert {'search', 'objdir', 'get', 'stats'} <= offered
-            assert offered.isdisjoint({'upsert', 'delete', 'remove_document'})
+            assert offered.isdisjoint({'upsert', 'delete', 'soft_delete', 'restore'})
             with _called_as(rv, ctx):
                 answer = self._write(inst, rng, 'delete', 'doc')
             assert answer['success'] is False and 'allow_write=true' in answer['error'], answer
@@ -976,7 +976,7 @@ class TestRocketrideVectorNode:
             )
             ctx = ToolCallContext(origin='dap', source_type='tools', targeted=True, caller={'auth': 'account'})
             with tool_call(ctx):
-                removed = inst.remove_document({'object_ids': ['doc']})
+                removed = inst.soft_delete({'object_ids': ['doc']})
                 deleted = inst.delete({'object_ids': ['doc']})
             assert removed['success'] is False and removed['code'] == 'WRITES_DISABLED'
             assert deleted['success'] is False and deleted['code'] == 'WRITES_DISABLED'
@@ -999,7 +999,7 @@ class TestRocketrideVectorNode:
                     )
                 ]
             )
-            for tool in (inst.remove_document, inst.delete):
+            for tool in (inst.soft_delete, inst.restore, inst.delete):
                 answer = tool({'object_ids': ['doc']})
                 assert answer['success'] is False and answer['code'] == 'WRITES_UNKNOWN_CALLER'
             assert glb.store.countChunks(rv.DocFilter()) == 1

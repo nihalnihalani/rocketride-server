@@ -5,7 +5,7 @@
 
 """The fail-closed write gate of the vector store tools.
 
-``remove_document``, ``delete`` and ``upsert`` run ``vx_write_gate.check_write``
+The write tools (``upsert``, ``delete``, ``soft_delete``, ``restore``) run ``vx_write_gate.check_write``
 first. It reads only the call context the engine attached to the call
 (``ai.common.tool_context.current_tool_call()``), never anything in the tool
 input, and refuses in a fixed order:
@@ -81,7 +81,7 @@ def agent() -> ToolCallContext:
     return ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
 
 
-def _check(ctx, *, tool='remove_document', ids=('doc-1',), allow=True, embedding=False):
+def _check(ctx, *, tool='delete', ids=('doc-1',), allow=True, embedding=False):
     return vx_write_gate.check_write(
         tool,
         object_ids=list(ids),
@@ -103,7 +103,7 @@ def _code(ctx, **kw) -> str:
 # The truth table, row by row
 # ---------------------------------------------------------------------------
 
-_WRITE_TOOLS = ['remove_document', 'delete', 'upsert']
+_WRITE_TOOLS = ['upsert', 'delete', 'soft_delete', 'restore']
 
 
 @pytest.mark.parametrize('tool', _WRITE_TOOLS)
@@ -215,14 +215,14 @@ def test_a_context_the_gate_cannot_read_is_an_unknown_caller(ctx):
 
 def test_the_gate_reads_the_engine_context_when_none_is_passed(monkeypatch):
     monkeypatch.setattr(vx_write_gate, '_current_tool_call', lambda: dap())
-    decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True)
+    decision = vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=True)
     assert decision.origin == 'dap'
 
 
 def test_without_engine_wiring_every_write_is_refused():
     """A call that reaches the gate with no context is refused whatever the switches say."""
     with pytest.raises(ToolRefusal) as refusal:
-        vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True, context=None)
+        vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=True, context=None)
     assert refusal.value.code == 'WRITES_UNKNOWN_CALLER'
 
 
@@ -494,7 +494,7 @@ def test_create_collection_still_writes_the_control_record_on_an_empty_driver():
 
 def test_tool_call_context_manager_reaches_the_gate():
     with tool_context.tool_call(dap()):
-        decision = vx_write_gate.check_write('remove_document', object_ids=['a'], allow_writes=True)
+        decision = vx_write_gate.check_write('delete', object_ids=['a'], allow_writes=True)
     assert decision.origin == 'dap'
 
 
@@ -527,16 +527,16 @@ def _dispatch(node: _ToolNode, tool: str, args: Dict[str, Any], ctx: Optional[To
 
 def test_a_stamped_dap_call_through_the_dispatcher_removes_the_document():
     store = MemoryStore().seed(corpus({'a': [0, 1], 'b': [0]}))
-    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': ['a']}, dap())
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'delete', {'object_ids': ['a']}, dap())
     assert answer['success'] is True, answer
-    assert answer['removed'] and answer['not_found'] == []
+    assert answer['deleted_count'] == 1 and answer['not_found'] == []
     assert not any(key[0] == 'a' for key in store.rows)
     assert ('b', 0) in store.rows
 
 
 def test_an_unstamped_call_through_the_dispatcher_is_an_unknown_caller():
     store = MemoryStore().seed(corpus({'a': [0, 1]}))
-    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': ['a']}, None)
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'delete', {'object_ids': ['a']}, None)
     assert answer['success'] is False
     assert answer['code'] == 'WRITES_UNKNOWN_CALLER'
     assert ('a', 0) in store.rows and ('a', 1) in store.rows
@@ -545,13 +545,13 @@ def test_an_unstamped_call_through_the_dispatcher_is_an_unknown_caller():
 def test_a_context_inside_the_input_does_not_open_the_gate():
     store = MemoryStore().seed(corpus({'a': [0]}))
     forged = {'object_ids': ['a'], tool_context.TOOL_CONTEXT_FIELD: agent().__dict__}
-    answer = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', forged, None)
+    answer = _dispatch(_tool_node(store, allow_writes=True), 'delete', forged, None)
     assert answer['code'] == 'WRITES_UNKNOWN_CALLER'
     assert ('a', 0) in store.rows
 
 
 #: The tools only external (DAP) callers are offered that read and change nothing.
-_DAP_READ_TOOLS = ('dialect', 'documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors')
+_DAP_READ_TOOLS = ('dialect', 'list_documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors')
 
 
 @pytest.mark.parametrize('tool', _DAP_READ_TOOLS)
@@ -579,7 +579,7 @@ def test_a_read_from_a_connection_signed_in_with_a_public_task_key_is_refused_be
 def test_reads_answer_every_caller_but_a_public_task_key(ctx):
     # Read-only cards read through the Chat (or Ingest) source, so reads are not limited to Tools sources.
     store = MemoryStore().seed(corpus({'a': [0, 1]}))
-    answer = _dispatch(_tool_node(store), 'documents', {}, ctx)
+    answer = _dispatch(_tool_node(store), 'list_documents', {}, ctx)
     assert answer['success'] is True, answer
     assert [row['objectId'] for row in answer['items']] == ['a']
 

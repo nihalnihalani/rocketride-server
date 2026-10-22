@@ -322,7 +322,7 @@ def test_documents_tool_lists_the_orphan_unsorted(collection):
     store, expect = collection
     node = VectorStoreToolMixin()
     node.IGlobal = types.SimpleNamespace(store=store)
-    answer = node.documents({'limit': 500, 'deleted': 'active'})
+    answer = node.list_documents({'limit': 500, 'deleted': 'active'})
     assert answer['success'] is True and answer['sorted'] is False
     orphans = {i['objectId'] for i in answer['items'] if not i['has_first_chunk']}
     assert orphans == expect.orphans

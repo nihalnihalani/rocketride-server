@@ -297,7 +297,7 @@ def test_the_base_hook_applies_no_filter_key_and_names_every_given_one():
 @pytest.mark.parametrize('store_cls', [MemoryStore, _ListingFilterStore])
 def test_without_a_filter_the_answer_carries_neither_key_and_the_hook_is_handed_none(args, store_cls):
     store = store_cls().seed(_library())
-    answer = node(store).documents(args)
+    answer = node(store).list_documents(args)
     assert answer['success'] is True and len(answer['items']) == 3
     assert 'filter_applied' not in answer and 'filter_ignored' not in answer
     assert not _FILTER_CAVEATS & set(answer['caveats'])
@@ -307,8 +307,8 @@ def test_without_a_filter_the_answer_carries_neither_key_and_the_hook_is_handed_
 
 def test_a_store_that_cannot_filter_answers_none_and_leaves_every_key_to_the_app():
     store = MemoryStore().seed(_library())
-    plain = node(store).documents({})
-    answer = node(store).documents({'filter': {'file_types': ['.MD'], 'path_prefix': 'C:/demo/handbooks/'}})
+    plain = node(store).list_documents({})
+    answer = node(store).list_documents({'filter': {'file_types': ['.MD'], 'path_prefix': 'C:/demo/handbooks/'}})
     assert answer['success'] is True
     assert answer['filter_applied'] == 'none'
     assert answer['filter_ignored'] == ['path_prefix', 'file_types'], 'in DOC_LIST_FILTER_KEYS order'
@@ -321,7 +321,7 @@ def test_a_driver_with_the_first_contracts_closed_hook_is_never_handed_the_filte
     # ExactListingStore overrides listDocumentPage(*, cursor, limit, object_ids, deleted, sort) as every
     # driver did before section 4.4; handing it filter= would raise TypeError (a STORE_ERROR).
     store = ExactListingStore().seed(_library())
-    answer = node(store).documents({'filter': {'path_prefix': 'C:/other/'}})
+    answer = node(store).list_documents({'filter': {'path_prefix': 'C:/other/'}})
     assert answer['success'] is True, answer
     assert answer['filter_applied'] == 'none' and answer['filter_ignored'] == ['path_prefix']
     assert answer['caveats'] == ['documents_filter_client']
@@ -330,7 +330,7 @@ def test_a_driver_with_the_first_contracts_closed_hook_is_never_handed_the_filte
 
 def test_a_driver_that_applies_every_given_key_answers_server():
     store = _ListingFilterStore().seed(_library())
-    answer = node(store).documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['.MD']}})
+    answer = node(store).list_documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['.MD']}})
     assert answer['filter_applied'] == 'server' and answer['filter_ignored'] == []
     assert answer['caveats'] == []
     assert _paths(answer) == ['C:/demo/handbooks/a.md']
@@ -339,7 +339,7 @@ def test_a_driver_that_applies_every_given_key_answers_server():
 
 def test_a_driver_that_skips_some_given_keys_answers_partial_and_names_them():
     store = _ListingFilterStore().seed(_library())
-    answer = node(store).documents(
+    answer = node(store).list_documents(
         {'filter': {'has_tables': False, 'path_prefix': 'C:/demo/handbooks/', 'ingested_after': '2026-10-01'}}
     )
     assert answer['filter_applied'] == 'partial'
@@ -351,21 +351,21 @@ def test_a_driver_that_skips_some_given_keys_answers_partial_and_names_them():
 
 def test_a_driver_that_skips_every_given_key_answers_none():
     store = _ListingFilterStore().seed(_library())
-    answer = node(store).documents({'filter': {'has_tables': True, 'min_chunks': 2}})
+    answer = node(store).list_documents({'filter': {'has_tables': True, 'min_chunks': 2}})
     assert answer['filter_applied'] == 'none' and answer['filter_ignored'] == ['min_chunks', 'has_tables']
     assert answer['caveats'] == ['documents_filter_client']
 
 
 def test_a_key_the_call_did_not_give_is_never_reported_as_ignored():
     store = _ListingFilterStore(also_skipped=('max_chunks', 'not_a_key')).seed(_library())
-    answer = node(store).documents({'filter': {'path_contains': 'OTHER'}})
+    answer = node(store).list_documents({'filter': {'path_contains': 'OTHER'}})
     assert answer['filter_applied'] == 'server' and answer['filter_ignored'] == []
     assert _paths(answer) == ['C:/other/c.md']
 
 
 def test_a_driver_that_declares_the_filter_but_keeps_the_base_hook_answers_none():
     store = _FilteringStore().seed(_library())
-    answer = node(store).documents({'filter': {'path_prefix': 'C:/other/'}})
+    answer = node(store).list_documents({'filter': {'path_prefix': 'C:/other/'}})
     assert answer['filter_applied'] == 'none' and answer['filter_ignored'] == ['path_prefix']
     assert 'documents_filter_client' in answer['caveats'] and len(answer['items']) == 3
 
@@ -382,7 +382,7 @@ def test_a_driver_that_declares_the_filter_but_keeps_the_base_hook_answers_none(
 )
 def test_a_refused_filter_is_invalid_input_and_never_reaches_the_store(value, sentence):
     store = _ListingFilterStore().seed(_library())
-    answer = node(store).documents({'filter': value})
+    answer = node(store).list_documents({'filter': value})
     assert answer['success'] is False and answer['code'] == 'INVALID_INPUT'
     assert sentence in answer['error']
     assert store.received == [] and not [call for call in store.calls if call[0] == 'listDocumentPage']
@@ -440,13 +440,13 @@ def test_a_driver_that_declares_the_filter_takes_it_in_its_own_list_documents():
     assert len(hooks) >= 9, sorted(hooks)  # the base, pgvector and the seven node drivers
 
 
-def test_the_documents_descriptor_names_the_filter_and_its_answer_keys():
-    meta = VectorStoreToolMixin.documents.__tool_meta__
+def test_the_list_documents_descriptor_names_the_filter_and_its_answer_keys():
+    meta = VectorStoreToolMixin.list_documents.__tool_meta__
     assert tuple(meta['input_schema']['properties']['filter']['properties']) == vx_types.DOC_LIST_FILTER_KEYS
     output = meta['output_schema']['properties']
     assert output['filter_applied']['enum'] == list(vx_types.FILTER_APPLIED_VALUES)
     assert output['filter_ignored'] == {'type': 'array', 'items': {'type': 'string'}}
-    assert meta['audience'] == ('dap',)
+    assert meta['audience'] == ('agent', 'dap'), 'list_documents is in the agent catalog (#2704)'
 
 
 # ---------------------------------------------------------------------------

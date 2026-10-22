@@ -25,8 +25,8 @@
 
 """The write gate of the vector store tools. It fails closed.
 
-``remove_document``, ``delete`` and ``upsert`` call :func:`check_write` first,
-before they check their input or touch the store. The gate reads who is calling only from the context the
+The write tools (``upsert``, ``delete``, ``soft_delete`` and ``restore``) call
+:func:`check_write` first, before they check their input or touch the store. The gate reads who is calling only from the context the
 engine attached to the call (``ai.common.tool_context.current_tool_call()``);
 nothing in the tool input is ever read as context.
 
@@ -55,8 +55,8 @@ wrapper turns into ``{success: false, code, error}``; nothing is written. On an
 engine without ``ai.common.tool_context``, or one that does not attach a
 context, every write is refused.
 
-Reads have one rule, :func:`check_read`, which the DAP-only read tools
-(``dialect``, ``documents``, ``chunks``, ``vectors``, ``sample``, ``project``,
+Reads have one rule, :func:`check_read`, which ``list_documents``, the DAP-only
+read tools (``dialect``, ``chunks``, ``vectors``, ``sample``, ``project``,
 ``neighbors``) and the embedding nodes' ``embed`` run first: a DAP call from a
 connection signed in with a task's public key (caller ``'public'``) is refused
 with ``READS_PUBLIC`` before anything is read. Every other caller reads as
@@ -86,8 +86,8 @@ def _engine_current_tool_call() -> Any:
 #: Reads the engine's context for the running call (None on an engine without it).
 _current_tool_call = _engine_current_tool_call if _tool_context is not None else None
 
-#: The tools that write and therefore run the gate.
-WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
+#: The tools that write and therefore run the gate (and that ``allow_write`` hides, the outer gate).
+WRITE_TOOLS = ('upsert', 'delete', 'soft_delete', 'restore')
 
 #: Caller kinds allowed to write through DAP.
 WRITE_CALLER_AUTH = ('account', 'task')
@@ -98,15 +98,22 @@ WRITE_SOURCE_TYPE = 'tools'
 #: Caller kinds the DAP-only read tools refuse: a connection signed in with a task's public key.
 READ_REFUSED_CALLER_AUTH = ('public',)
 
-_VERB = {'remove_document': 'remove documents', 'delete': 'remove documents', 'upsert': 'add documents'}
+_VERB = {
+    'delete': 'remove documents',
+    'soft_delete': 'move documents to the trash',
+    'restore': 'restore documents',
+    'upsert': 'add documents',
+}
 _DISABLED = {
-    'remove_document': 'Removing documents is turned off on this store node (allow_writes).',
     'delete': 'Removing documents is turned off on this store node (allow_writes).',
+    'soft_delete': 'Moving documents to the trash is turned off on this store node (allow_writes).',
+    'restore': 'Restoring documents is turned off on this store node (allow_writes).',
     'upsert': 'Adding documents through tool calls is turned off on this store node (allow_writes).',
 }
 _RESERVED = {
-    'remove_document': "'schema' is the collection's control record and cannot be removed.",
     'delete': "'schema' is the collection's control record and cannot be removed.",
+    'soft_delete': "'schema' is the collection's control record and cannot be moved to the trash.",
+    'restore': "'schema' is the collection's control record and cannot be restored.",
     'upsert': "'schema' is the collection's control record and cannot be written.",
 }
 
@@ -178,7 +185,7 @@ def check_write(
 ) -> GateDecision:
     """Decide whether ``tool`` may write ``object_ids``; raise a refusal when it may not.
 
-    :param tool: ``'remove_document'``, ``'delete'`` or ``'upsert'``.
+    :param tool: One of :data:`WRITE_TOOLS`.
     :param object_ids: Every objectId the call would write or remove.
     :param allow_writes: The node's ``allow_writes`` switch (DAP calls); agents do not read it.
     :param supplies_embedding: True when an ``upsert`` carries caller-supplied embeddings.

@@ -349,6 +349,7 @@ TOOL_CODES: Tuple[str, ...] = (
     'INVALID_INPUT',
     'UNSUPPORTED',
     'NOT_FOUND',
+    'IN_TRASH',
     'RESERVED_ID',
     'COLLECTION_MISSING',
     'STORE_ERROR',

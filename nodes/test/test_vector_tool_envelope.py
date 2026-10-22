@@ -44,14 +44,14 @@ from .test_vector_hooks import MemoryStore, corpus
 LEGACY_AGENT_CATALOG_SHA256 = '36741af73b843e2c550dbddbd1c53579d506e16740ab73755031d3aa26fb0fe6'
 
 LEGACY_TOOLS = ('delete', 'get', 'objdir', 'search', 'stats', 'upsert')
+#: #2704's three, listed for agents too: the document listing and the trash.
+TRASH_TOOLS = ('list_documents', 'restore', 'soft_delete')
 EXPLORER_TOOLS = (
     'chunks',
     'dialect',
-    'documents',
     'neighbors',
     'project',
     'recommend',
-    'remove_document',
     'sample',
     'similarity_matrix',
     'vectors',
@@ -513,7 +513,7 @@ def _node(store: Any) -> Node:
 _INPUTS = {
     'dialect': {},
     'stats': {},
-    'documents': {},
+    'list_documents': {},
     'chunks': {'object_id': 'a'},
     'vectors': {'keys': [['a', 0]]},
     'sample': {'n': 5},
@@ -522,7 +522,8 @@ _INPUTS = {
     'recommend': {'positive': [['a', 0]]},
     'similarity_matrix': {'keys': [['a', 0], ['a', 1]]},
     'search': {'vector': [0.1, 0.2]},
-    'remove_document': {'object_ids': ['a']},
+    'soft_delete': {'object_ids': ['a']},
+    'restore': {'object_ids': ['a']},
     'delete': {'object_ids': ['a']},
     'upsert': {'documents': [{'content': 'x', 'object_id': 'a'}]},
     'get': {'object_id': 'a'},
@@ -531,7 +532,7 @@ _INPUTS = {
 
 
 def test_every_tool_has_an_input_case():
-    assert set(_INPUTS) == set(LEGACY_TOOLS) | set(EXPLORER_TOOLS)
+    assert set(_INPUTS) == set(LEGACY_TOOLS) | set(TRASH_TOOLS) | set(EXPLORER_TOOLS)
 
 
 @pytest.mark.parametrize('tool', sorted(_INPUTS))
@@ -595,13 +596,13 @@ def _tool_methods():
     return inst, inst._collect_tool_methods()
 
 
-def test_the_store_tools_are_the_six_legacy_ones_plus_the_explorer_set():
+def test_the_store_tools_are_the_six_legacy_ones_the_trash_tools_and_the_explorer_set():
     _inst, methods = _tool_methods()
-    assert set(methods) == set(LEGACY_TOOLS) | set(EXPLORER_TOOLS)
+    assert set(methods) == set(LEGACY_TOOLS) | set(TRASH_TOOLS) | set(EXPLORER_TOOLS)
 
 
-@pytest.mark.parametrize('tool', LEGACY_TOOLS)
-def test_legacy_tools_stay_listed_for_agents(tool):
+@pytest.mark.parametrize('tool', LEGACY_TOOLS + TRASH_TOOLS)
+def test_legacy_and_trash_tools_are_listed_for_agents(tool):
     _inst, methods = _tool_methods()
     assert methods[tool].__tool_meta__['audience'] == ('agent', 'dap')
 
@@ -612,18 +613,18 @@ def test_explorer_tools_are_listed_for_external_callers_only(tool):
     assert methods[tool].__tool_meta__['audience'] == ('dap',)
 
 
-@pytest.mark.parametrize('tool', LEGACY_TOOLS + EXPLORER_TOOLS)
+@pytest.mark.parametrize('tool', LEGACY_TOOLS + TRASH_TOOLS + EXPLORER_TOOLS)
 def test_every_store_tool_runs_inside_the_wrapper(tool):
     _inst, methods = _tool_methods()
     assert getattr(methods[tool], '__vectordb_tool__', False) is True
 
 
-def test_the_agent_catalog_is_byte_identical_to_today():
+def test_the_six_legacy_agent_descriptors_are_byte_identical_to_develop():
     inst, methods = _tool_methods()
     agent = {name: m for name, m in methods.items() if 'agent' in m.__tool_meta__['audience']}
-    descriptors = inst._build_tool_descriptors(dict(sorted(agent.items())))
-    text = json.dumps(descriptors, sort_keys=True, separators=(',', ':'))
-    assert sorted(agent) == sorted(LEGACY_TOOLS)
+    assert sorted(agent) == sorted(LEGACY_TOOLS + TRASH_TOOLS)
+    legacy = {name: m for name, m in sorted(agent.items()) if name in LEGACY_TOOLS}
+    text = json.dumps(inst._build_tool_descriptors(legacy), sort_keys=True, separators=(',', ':'))
     assert hashlib.sha256(text.encode('utf-8')).hexdigest() == LEGACY_AGENT_CATALOG_SHA256
 
 
@@ -705,15 +706,15 @@ def test_stats_matches_the_fixture(wired):
     _same_keys(_node(MemoryStore()).stats({}), _fixture('stats_collection_missing_legacy'), 'stats(missing)')
 
 
-def test_documents_matches_the_fixture(wired):
+def test_list_documents_matches_the_fixture(wired):
     _store, inst, _sample = wired
-    answer, fixture = inst.documents({}), _fixture('documents_page1')
-    _same_keys(answer, fixture, 'documents')
+    answer, fixture = inst.list_documents({}), _fixture('list_documents_page1')
+    _same_keys(answer, fixture, 'list_documents')
     _same_keys(
         answer['items'][0],
         fixture['items'][0],
-        'documents.items[]',
-        _additive(fixture['items'][0], _fixture('documents_filter_server')['items'][0]),
+        'list_documents.items[]',
+        _additive(fixture['items'][0], _fixture('list_documents_filter_server')['items'][0]),
     )
 
 
@@ -799,12 +800,28 @@ def test_search_matches_the_fixture(wired):
     _same_keys(answer['results'][0], fixture['results'][0], 'search.results[]')
 
 
-def test_remove_document_matches_the_fixture(wired):
-    _store, inst, _sample = wired
-    answer, fixture = inst.remove_document({'object_ids': ['doc01']}), _fixture('remove_document_ok')
-    _same_keys(answer, fixture, 'remove_document')
-    _same_keys(answer['audit'], fixture['audit'], 'remove_document.audit')
-    _same_keys(answer['removed'][0], fixture['removed'][0], 'remove_document.removed[]')
+def test_the_trash_answers_match_the_fixtures(wired):
+    store, inst, _sample = wired
+    for tool, args, name in (
+        ('soft_delete', {'object_ids': ['doc01']}, 'soft_delete_ok'),
+        ('restore', {'object_ids': ['doc01']}, 'restore_ok'),
+        ('delete', {'object_ids': ['doc01']}, 'delete_ok'),
+    ):
+        answer, fixture = getattr(inst, tool)(args), _fixture(name)
+        _same_keys(answer, fixture, tool)
+        _same_keys(answer['audit'], fixture['audit'], f'{tool}.audit')
+    store.markDeleted(['doc02'])
+    store.rows[('doc03', 0)].metadata.isDeleted = True
+    emptied = inst.delete({'object_ids': ['doc02', 'doc03'], 'deleted_only': True})
+    fixture = _fixture('delete_deleted_only')
+    _same_keys(emptied, fixture, 'delete(deleted_only)')
+    assert emptied['kept_live'] == ['doc03'] and fixture['kept_live']
+    in_trash = inst.list_documents({'deleted': 'deleted'})
+    assert [item['objectId'] for item in in_trash['items']] == ['doc03']
+    store.markDeleted(['doc00'])
+    answer, fixture = inst.chunks({'object_id': 'doc00'}), _fixture('chunks_in_trash')
+    _same_keys(answer, fixture, 'chunks(in trash)')
+    assert answer['code'] == fixture['code'] == 'IN_TRASH'
 
 
 def test_every_documented_code_has_an_app_sentence():

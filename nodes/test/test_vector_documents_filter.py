@@ -445,7 +445,7 @@ def test_pgvector_without_the_meta_column_leaves_the_ingest_keys_to_the_app(pg):
 def test_documents_tool_answers_server_and_partial_from_the_pgvector_driver(pg):
     store = pg.open()
     _seed(store)
-    answer = node(store).documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['md']}})
+    answer = node(store).list_documents({'filter': {'path_prefix': 'C:/demo/handbooks/', 'file_types': ['md']}})
     assert answer['success'] is True
     assert [item['objectId'] for item in answer['items']] == ['falcon', 'orphan']
     assert (answer['filter_applied'], answer['filter_ignored'], answer['total']) == ('server', [], 2)
@@ -453,11 +453,11 @@ def test_documents_tool_answers_server_and_partial_from_the_pgvector_driver(pg):
 
     _legacy_table(pg, LIBRARY)
     legacy = pg.open('legacy')
-    answer = node(legacy).documents({'filter': {'ingested_before': '2026-10-02', 'max_chunks': 1}})
+    answer = node(legacy).list_documents({'filter': {'ingested_before': '2026-10-02', 'max_chunks': 1}})
     assert (answer['filter_applied'], answer['filter_ignored']) == ('partial', ['ingested_before'])
     assert 'documents_filter_partial' in answer['caveats']
     assert [item['objectId'] for item in answer['items']] == ['axb', 'notes', 'bak', 'mdx']
-    answer = node(legacy).documents({'filter': {'ingested_before': '2026-10-02'}})
+    answer = node(legacy).list_documents({'filter': {'ingested_before': '2026-10-02'}})
     assert (answer['filter_applied'], answer['filter_ignored']) == ('none', ['ingested_before'])
     assert 'documents_filter_client' in answer['caveats'] and answer['total'] == len(LIBRARY)
 
@@ -537,7 +537,7 @@ def test_documents_tool_answers_the_health_fields(pg):
     store = pg.open()
     _seed(store, HEALTH)
     _soft_delete(pg, 'docs', ('gappy', 4))
-    items = {item['objectId']: item for item in node(store).documents({})['items']}
+    items = {item['objectId']: item for item in node(store).list_documents({})['items']}
     assert (items['gappy']['max_chunk_id'], items['gappy']['deleted_chunks']) == (3, 1)
     assert (items['whole']['max_chunk_id'], items['whole']['deleted_chunks']) == (2, 0)
 

@@ -358,12 +358,12 @@ def test_hiding_holds_on_the_real_instance_base():
         allow_write=False,
     )
 
-    writes = {'upsert', 'delete', 'remove_document'}
+    writes = {'upsert', 'delete', 'soft_delete', 'restore'}
     assert set(inst._collect_tool_methods()) == set()
     inst.IGlobal.expose_tools = True
     offered = set(inst._collect_tool_methods())
-    # The Vector Explorer's read tools (dialect, documents, chunks, ...) are offered beside the agent ones.
-    assert {'search', 'objdir', 'get', 'stats', 'dialect', 'documents', 'chunks'} <= offered
+    # The Vector Explorer's read tools (dialect, list_documents, chunks, ...) are offered beside the agent ones.
+    assert {'search', 'objdir', 'get', 'stats', 'dialect', 'list_documents', 'chunks'} <= offered
     assert offered.isdisjoint(writes)
     inst.IGlobal.allow_write = True
     assert set(inst._collect_tool_methods()) == offered | writes

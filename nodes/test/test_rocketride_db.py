@@ -999,8 +999,8 @@ class TestRocketrideVectorWriteGate:
         config = {'collection': 'rr_vec', 'similarity': 'cosine', 'expose_tools': True, 'allow_writes': True}
         glb, inst = self._node(mock_rv, config)
         offered = set(inst._collect_tool_methods())
-        assert {'search', 'objdir', 'get', 'stats', 'dialect', 'documents'} <= offered
-        assert offered.isdisjoint({'upsert', 'delete', 'remove_document'})
+        assert {'search', 'objdir', 'get', 'stats', 'dialect', 'list_documents'} <= offered
+        assert offered.isdisjoint({'upsert', 'delete', 'soft_delete', 'restore'})
         ctx = ToolCallContext(origin='agent', source_type=None, targeted=True, caller={'auth': 'agent'})
         with tool_call(ctx):
             answer = inst.delete({'object_ids': ['doc']})

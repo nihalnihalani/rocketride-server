@@ -431,13 +431,13 @@ def test_the_shipped_profile_resolves_through_the_real_node(tools_env, monkeypat
         assert glb.expose_tools is True and glb.allow_write is False
         if real_collector:
             reads = set(inst._collect_tool_methods())
-            assert {'search', 'objdir', 'get', 'stats', 'dialect', 'documents'} <= reads
-            assert reads.isdisjoint({'upsert', 'delete', 'remove_document'})
+            assert {'search', 'objdir', 'get', 'stats', 'dialect', 'list_documents'} <= reads
+            assert reads.isdisjoint({'upsert', 'delete', 'soft_delete', 'restore'})
 
         glb, inst = make({'collection': TABLE, 'expose_tools': True, 'allow_write': True})
         assert glb.expose_tools is True and glb.allow_write is True
         if real_collector:
-            assert set(inst._collect_tool_methods()) == reads | {'upsert', 'delete', 'remove_document'}
+            assert set(inst._collect_tool_methods()) == reads | {'upsert', 'delete', 'soft_delete', 'restore'}
     finally:
         for glb in opened:
             store = getattr(glb, 'store', None)

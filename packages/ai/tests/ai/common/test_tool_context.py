@@ -778,9 +778,9 @@ def test_audit_block_is_forwarded_to_the_account_audit(monkeypatch):
     monkeypatch.setattr(account, 'audit', audit)
     result = {
         'success': True,
-        'removed_chunks': 2,
+        'matched_chunks': 2,
         'audit': {
-            'action': 'vector.remove_document',
+            'action': 'vector.soft_delete',
             'node': 'store_1',
             'provider': 'postgres',
             'collection': 'vx_demo_docs',
@@ -792,16 +792,14 @@ def test_audit_block_is_forwarded_to_the_account_audit(monkeypatch):
         },
     }
     cmd, _task = _data_commands('local-acceptance-key', result=result)
-    response, _request = _process(
-        cmd, {'subcommand': 'tool', 'tool': 'remove_document', 'nodeId': 'store_1', 'input': {}}
-    )
+    response, _request = _process(cmd, {'subcommand': 'tool', 'tool': 'soft_delete', 'nodeId': 'store_1', 'input': {}})
     assert response['body']['result'] == result
     audit.assert_awaited_once()
     kwargs = audit.await_args.kwargs
     args = audit.await_args.args
     assert args == ('user-1',)
     assert kwargs['source'] == 'vector'
-    assert kwargs['reason'] == 'vector.remove_document'
+    assert kwargs['reason'] == 'vector.soft_delete'
     assert kwargs['org_id'] == 'org-1'
     assert kwargs['request_data'] == {
         'node': 'store_1',
@@ -893,7 +891,9 @@ def test_audit_actions_outside_the_vector_namespace_are_not_recorded(monkeypatch
     audit.assert_not_awaited()
 
 
-@pytest.mark.parametrize('action', ['vector.upsert', 'vector.delete', 'vector.remove_document', 'vector.v2_write'])
+@pytest.mark.parametrize(
+    'action', ['vector.upsert', 'vector.delete', 'vector.soft_delete', 'vector.restore', 'vector.v2_write']
+)
 def test_vector_audit_actions_are_recorded(monkeypatch, action):
     """The write tools' actions are recorded under their own label."""
     from ai.account import account

@@ -33,9 +33,9 @@
 #
 # The table is in a managed RocketRide database, so the whole tool surface is
 # opt-in through the expose_tools setting (off by default), and the write tools
-# (upsert, delete, remove_document) also need the allow_write setting (off by
-# default). Past that outer gate, a write from a DAP caller (the Vector
-# Explorer's trash can) still needs allow_writes, and the write gate's caller
+# (upsert, delete, soft_delete, restore) also need the allow_write setting (off
+# by default). Past that outer gate, a write from a DAP caller (the Vector
+# Explorer's trash) still needs allow_writes, and the write gate's caller
 # rules apply (vx_write_gate). The data lanes are always available.
 # ------------------------------------------------------------------------------
 import os
