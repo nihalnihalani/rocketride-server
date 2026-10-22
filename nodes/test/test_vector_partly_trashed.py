@@ -20,6 +20,7 @@ since a client takes an empty page for the end.
 
 from __future__ import annotations
 
+import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -74,13 +75,18 @@ def _node(store, logical: str, model: str):
     return inst
 
 
+def _fresh_collection() -> str:
+    """A collection name of its own: the Qdrant and Chroma mocks keep their data between stores."""
+    return f'vx_unit_{uuid.uuid4().hex[:12]}'
+
+
 def _store(kind: str):
     """(store, chunk factory, model, logical type) for one kind of store."""
     if kind in FAKES:
         return FAKES[kind](), (lambda oid, ids: [hooks.make_doc(oid, i) for i in ids]), hooks.MODEL, 'postgres'
     if kind == 'qdrant':
         module = _loaded.setdefault('qdrant', qdrant_mock.load_driver())
-        store = qdrant_mock.make_store(module)
+        store = qdrant_mock.make_store(module, collection=_fresh_collection())
         return (
             store,
             (lambda oid, ids: [qdrant_mock.make_doc(oid, i, h.vector_for(oid, i, 4)) for i in ids]),
@@ -89,7 +95,7 @@ def _store(kind: str):
         )
     if kind == 'chroma':
         module = _loaded.setdefault('chroma', chroma_mock.load_driver())
-        store = chroma_mock.make_store(module)
+        store = chroma_mock.make_store(module, collection=_fresh_collection())
         return (
             store,
             (lambda oid, ids: [chroma_mock.make_doc(oid, i, h.vector_for(oid, i, 4)) for i in ids]),

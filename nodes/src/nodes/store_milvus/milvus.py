@@ -60,6 +60,9 @@ DEFAULT_TIMEOUT = 60
 # Largest offset + limit a Milvus query accepts
 MAX_QUERY_WINDOW = 16384
 
+# Documents whose rows one read of markDeleted / markActive covers
+MARK_IDS_PER_QUERY = 100
+
 # objectId of the collection's control record
 CONTROL_OBJECT_ID = 'schema'
 
@@ -844,63 +847,74 @@ class Store(DocumentStoreBase):
             self.client.upsert(collection_name=self.collection, data=batch)
         return changed
 
+    def _rowsOfObjects(self, objectIds: List[str], output_fields: List[str]) -> Iterator[List[dict]]:
+        """
+        Every row of ``objectIds``, one page at a time.
+
+        A query without a limit answers Milvus's default page only, and offset + limit may
+        not pass MAX_QUERY_WINDOW, so the rows are read for at most MARK_IDS_PER_QUERY
+        documents at a time, by windows of chunk ids small enough that one query holds a
+        whole window. Chunk ids do not change when a row is upserted, so marking the rows
+        of one page does not move a row into or out of another.
+        """
+        ids = [str(oid) for oid in dict.fromkeys(objectIds or [])]
+        for start in range(0, len(ids), MARK_IDS_PER_QUERY):
+            batch = ids[start : start + MARK_IDS_PER_QUERY]
+            of_batch = f"meta['objectId'] in [{_str_list(batch)}]"
+            window = max(1, MAX_QUERY_WINDOW // len(batch))
+            remaining = self._countWhere([of_batch])
+            low = 0
+            while remaining > 0:
+                rows = self.client.query(
+                    collection_name=self.collection,
+                    filter=f"{of_batch} and meta['chunkId'] >= {low} and meta['chunkId'] < {low + window}",
+                    output_fields=output_fields,
+                    limit=len(batch) * window,
+                )
+                if rows:
+                    remaining -= len(rows)
+                    yield rows
+                elif not self._countWhere([of_batch, f"meta['chunkId'] >= {low + window}"]):
+                    # Nothing past this window either: the rest has no chunk id to page by
+                    break
+                low += window
+
     @_backend_errors('markDeleted')
     def markDeleted(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Every row is read (see _rowsOfObjects); returns the rows moved to the trash.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
+        if not objectIds or not self.doesCollectionExist():
             return 0
-
-        must_conditions = []
-
-        # If a permissionId list was specified
-        if objectIds:
-            must_conditions.append(f"meta['objectId'] in [{_str_list(objectIds)}]")
-
-        filter_expression = ' and '.join(must_conditions) if must_conditions else None
-        if not filter_expression:
-            return 0
-
-        results = self.client.query(
-            collection_name=self.collection, filter=filter_expression, output_fields=['id', 'vector', 'content', 'meta']
-        )
 
         # Batch-update instead of one-at-a-time to avoid performance bottleneck
-        return self._batchUpsertResults(results, isDeleted=True)
+        return sum(
+            self._batchUpsertResults(rows, isDeleted=True)
+            for rows in self._rowsOfObjects(objectIds, ['id', 'vector', 'content', 'meta'])
+        )
 
     @_backend_errors('markActive')
     def markActive(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+        Every row is read (see _rowsOfObjects); returns the rows taken out of the trash.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
+        if not objectIds or not self.doesCollectionExist():
             return 0
 
-        must_conditions = []
-
-        # If a permissionId list was specified
-        if objectIds:
-            must_conditions.append(f"meta['objectId'] in [{_str_list(objectIds)}]")
-
-        filter_expression = ' and '.join(must_conditions) if must_conditions else None
-        if not filter_expression:
-            return 0
-
-        results = self.client.query(
-            collection_name=self.collection, filter=filter_expression, output_fields=['id', 'vector', 'content', 'meta']
+        return sum(
+            self._batchUpsertResults(rows, isDeleted=False)
+            for rows in self._rowsOfObjects(objectIds, ['id', 'vector', 'content', 'meta'])
         )
-
-        # Batch-update instead of one-at-a-time to avoid performance bottleneck
-        return self._batchUpsertResults(results, isDeleted=False)
 
     @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
