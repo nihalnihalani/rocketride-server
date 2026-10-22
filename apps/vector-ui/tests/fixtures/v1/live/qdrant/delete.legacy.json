@@ -4,23 +4,19 @@
     "userId"
   ],
   "success": true,
-  "removed": [
-    {
-      "objectId": "91ae15d4-3f6e-589f-bb81-72301f2ca1b6",
-      "chunks_removed": 5
-    }
-  ],
+  "deleted_count": 1,
+  "removed_chunks": 4,
   "not_found": [],
-  "removed_chunks": 5,
+  "kept_live": [],
   "audit": {
-    "action": "vector.remove_document",
+    "action": "vector.delete",
     "node": "store_1",
-    "provider": "chroma",
+    "provider": "qdrant",
     "collection": "vx_tp_wire_legacy",
     "object_ids": [
-      "91ae15d4-3f6e-589f-bb81-72301f2ca1b6"
+      "dcfda41e-afa5-5f8d-b1c7-860cc0e03189"
     ],
-    "rows": 5,
+    "rows": 4,
     "caller": {
       "auth": "account",
       "userId": "<scrubbed>",
