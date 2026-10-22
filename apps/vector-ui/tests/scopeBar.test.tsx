@@ -45,7 +45,7 @@ moduleWithLoad._load = function (request: string, parent: unknown, isMain: boole
 
 const { ScopeBar, draftCondition } = require('../src/components/ScopeBar') as typeof import('../src/components/ScopeBar');
 const { DocumentDirectory } = require('../src/components/DocumentDirectory') as typeof import('../src/components/DocumentDirectory');
-const { pagerApplyPage, pagerBegin, pagerFail, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
+const { pagerApplyPage, pagerBegin, pagerInit } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 const { readDocumentsPage, readStats } = require('../src/vector/results') as typeof import('../src/vector/results');
 const { FILTER_TEXT_MAX, SCOPE_FAILED_TEXT, listingFilter, resolveScope, scopeFromFilter, tooLargeText } = require('../src/vector/filters') as typeof import('../src/vector/filters');
 const { consoleScope } = require('../src/vector/consoleModel') as typeof import('../src/vector/consoleModel');
