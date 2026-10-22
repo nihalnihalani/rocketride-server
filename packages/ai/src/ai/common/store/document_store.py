@@ -1395,19 +1395,20 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
         return None
 
     def _collect_tool_methods(self):
-        """Advertise no tools while the node does not expose them, and the write tools only when it allows writes.
+        """List the tools this node advertises: none unless it exposes tools, and no write tool unless it allows writes.
 
-        The engine's ``tool.query`` discovery walks this; leaving a tool out
-        means an agent never sees a tool it cannot call (the pattern
-        ``tool_filesystem`` uses for its allow flags). A direct invocation is
-        still refused by the tools themselves.
+        ``tool.query`` discovery reads this map, so a tool left out of it is
+        one a caller never sees (``tool_filesystem`` hides its tools behind
+        its allow flags the same way). Calling a hidden tool by name is still
+        refused, by the envelope's outer gate.
         """
         if not self._vectordb_expose_tools():
             return {}
-        methods = super()._collect_tool_methods()
-        if self._vectordb_allow_write():
-            return methods
-        return {name: method for name, method in methods.items() if name not in self._VECTORDB_WRITE_TOOLS}
+        advertised = dict(super()._collect_tool_methods())
+        if not self._vectordb_allow_write():
+            for write_tool in self._VECTORDB_WRITE_TOOLS:
+                advertised.pop(write_tool, None)
+        return advertised
 
     def _vectordb_compute_embedding(self, query_text: str) -> Optional[List[float]]:
         """Attempt to compute a query embedding for semantic search.
