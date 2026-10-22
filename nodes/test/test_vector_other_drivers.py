@@ -582,6 +582,21 @@ def test_remove_counted_reports_the_rows_removed(adapter, store):
     assert store.describe().control_record is True
 
 
+def test_mark_deleted_and_active_return_the_chunks_they_moved(adapter, store):
+    """The trash writes answer the chunks they moved into or out of the trash (soft_delete's matched_chunks)."""
+    h.ingest(store, 'doc-a', '/docs/a.md', [0, 1, 2])
+    h.ingest(store, 'doc-b', '/docs/b.md', [0, 1])
+    assert store.markDeleted(['doc-a', 'ghost']) == 3
+    assert store.markDeleted(['doc-a']) == 0, 'already in the trash: nothing moves'
+    assert store.markActive(['doc-a', 'doc-b']) == 3, 'doc-b was never in the trash'
+    assert store.markActive(['doc-a']) == 0
+    assert store.markDeleted([]) == 0 and store.markActive([]) == 0
+    assert sorted(doc.metadata.objectId for doc in store.get(DocFilter(chunkIds=[0], isDeleted=False))) == [
+        'doc-a',
+        'doc-b',
+    ]
+
+
 # -----------------------------------------------------------------------------
 # Search and paths
 # -----------------------------------------------------------------------------

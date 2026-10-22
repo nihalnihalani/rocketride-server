@@ -675,21 +675,30 @@ class PgVectorStore(DocumentStoreBase):
         """Delete every chunk of ``objectIds`` (never the control record)."""
         self.removeCounted(objectIds)
 
-    def markDeleted(self, objectIds: List[str]) -> None:
-        """Mark every chunk of ``objectIds`` deleted (never the control record)."""
-        self._set_deleted(objectIds, True)
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
+        """Mark every chunk of ``objectIds`` deleted (never the control record); return the chunks moved."""
+        return self._set_deleted(objectIds, True)
 
-    def markActive(self, objectIds: List[str]) -> None:
-        """Mark every chunk of ``objectIds`` active again (never the control record)."""
-        self._set_deleted(objectIds, False)
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
+        """Mark every chunk of ``objectIds`` active again (never the control record); return the chunks moved."""
+        return self._set_deleted(objectIds, False)
 
-    def _set_deleted(self, objectIds: List[str], value: bool) -> None:
+    def _set_deleted(self, objectIds: List[str], value: bool) -> int:
+        """One UPDATE over the chunks of ``objectIds`` in the other state; its row count is what moved.
+
+        A NULL ``isdeleted`` reads as active, so ``markDeleted`` takes it and ``markActive`` leaves it.
+        """
         ids = [str(o) for o in objectIds or []]
         if not ids or not self._exists_now():
-            return
-        statement = self._sql.set_deleted(Where(deleted='all', object_ids=ids), value)
+            return 0
+        statement = self._sql.set_deleted(Where(deleted='active' if value else 'deleted', object_ids=ids), value)
+
+        def work(cur):
+            cur.execute(*statement)
+            return max(0, int(cur.rowcount or 0))
+
         with self._write_lock:
-            self._db.run_write(lambda cur: cur.execute(*statement))
+            return self._db.run_write(work)
 
     # ------------------------------------------------------------------
     # Explorer hooks

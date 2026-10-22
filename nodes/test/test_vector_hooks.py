@@ -172,15 +172,20 @@ class MemoryStore(DocumentStoreBase):
         for key in [k for k in self.rows if k[0] in objectIds]:
             del self.rows[key]
 
-    def markDeleted(self, objectIds: List[str]) -> None:
-        for key, doc in self.rows.items():
-            if key[0] in objectIds:
-                doc.metadata.isDeleted = True
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
+        return self._mark(objectIds, True)
 
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
+        return self._mark(objectIds, False)
+
+    def _mark(self, objectIds: List[str], value: bool) -> int:
+        """Set isDeleted on every chunk of ``objectIds``; return the chunks whose state changed."""
+        moved = 0
         for key, doc in self.rows.items():
-            if key[0] in objectIds:
-                doc.metadata.isDeleted = False
+            if key[0] in objectIds and key[0] != 'schema' and bool(doc.metadata.isDeleted) != value:
+                doc.metadata.isDeleted = value
+                moved += 1
+        return moved
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         for key in sorted(k for k in self.rows if k[0] == objectId):

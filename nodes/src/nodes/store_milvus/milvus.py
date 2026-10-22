@@ -815,20 +815,25 @@ class Store(DocumentStoreBase):
 
         return
 
-    def _batchUpsertResults(self, results: List[dict], *, isDeleted: bool) -> None:
+    def _batchUpsertResults(self, results: List[dict], *, isDeleted: bool) -> int:
         """
         Batch-update the isDeleted metadata field on a list of query results.
 
-        Collects results into batches of bulkInsertBatchSize and upserts them
-        together, avoiding the performance bottleneck of one-at-a-time upserts.
+        Collects the results in the other state into batches of bulkInsertBatchSize and
+        upserts them together, avoiding the performance bottleneck of one-at-a-time
+        upserts. A result without the flag reads as active. Returns the results changed.
         """
         batch: List[dict] = []
+        changed = 0
 
         for result in results:
             meta = _plain_meta(result.get('meta'))
+            if bool(meta.get('isDeleted')) == isDeleted:
+                continue
             meta['isDeleted'] = isDeleted
             result['meta'] = meta
             batch.append(result)
+            changed += 1
 
             if len(batch) >= self.bulkInsertBatchSize:
                 self.client.upsert(collection_name=self.collection, data=batch)
@@ -837,9 +842,10 @@ class Store(DocumentStoreBase):
         # Flush remaining
         if batch:
             self.client.upsert(collection_name=self.collection, data=batch)
+        return changed
 
     @_backend_errors('markDeleted')
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as deleted.
 
@@ -848,7 +854,7 @@ class Store(DocumentStoreBase):
         # By definition, if the collection does not exists, there
         # is nothing to mark
         if not self.doesCollectionExist():
-            return
+            return 0
 
         must_conditions = []
 
@@ -858,18 +864,17 @@ class Store(DocumentStoreBase):
 
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
         if not filter_expression:
-            return
+            return 0
 
         results = self.client.query(
             collection_name=self.collection, filter=filter_expression, output_fields=['id', 'vector', 'content', 'meta']
         )
 
         # Batch-update instead of one-at-a-time to avoid performance bottleneck
-        self._batchUpsertResults(results, isDeleted=True)
-        return
+        return self._batchUpsertResults(results, isDeleted=True)
 
     @_backend_errors('markActive')
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as active.
 
@@ -878,7 +883,7 @@ class Store(DocumentStoreBase):
         # By definition, if the collection does not exists, there
         # is nothing to mark
         if not self.doesCollectionExist():
-            return
+            return 0
 
         must_conditions = []
 
@@ -888,15 +893,14 @@ class Store(DocumentStoreBase):
 
         filter_expression = ' and '.join(must_conditions) if must_conditions else None
         if not filter_expression:
-            return
+            return 0
 
         results = self.client.query(
             collection_name=self.collection, filter=filter_expression, output_fields=['id', 'vector', 'content', 'meta']
         )
 
         # Batch-update instead of one-at-a-time to avoid performance bottleneck
-        self._batchUpsertResults(results, isDeleted=False)
-        return
+        return self._batchUpsertResults(results, isDeleted=False)
 
     @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:

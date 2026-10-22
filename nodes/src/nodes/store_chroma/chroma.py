@@ -868,50 +868,57 @@ class Store(DocumentStoreBase):
 
         return
 
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+
+        @returns: The number of chunks moved to the trash.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
-            return
+        if not objectIds or not self.doesCollectionExist():
+            return 0
 
-        if not objectIds:
-            return
+        return self._setIsDeleted(objectIds, True)
 
-        self._setIsDeleted(objectIds, True)
-        return
-
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+
+        @returns: The number of chunks taken out of the trash.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
-            return
+        if not objectIds or not self.doesCollectionExist():
+            return 0
 
-        if not objectIds:
-            return
+        return self._setIsDeleted(objectIds, False)
 
-        self._setIsDeleted(objectIds, False)
-        return
+    def _setIsDeleted(self, objectIds: List[str], value: bool) -> int:
+        """Set isDeleted on the records of ``objectIds`` in the other state (update takes ids and full metadata).
 
-    def _setIsDeleted(self, objectIds: List[str], value: bool) -> None:
-        """Set isDeleted on every record of ``objectIds`` (update takes ids and full metadata)."""
+        A record without the flag reads as active. Returns the records changed.
+        """
+        moved = 0
         for batch in self._idBatches(objectIds):
             results = self.collectionObj.get(where={'objectId': {'$in': batch}}, include=['metadatas'])
-            ids = list(results.get('ids') or [])
-            if not ids:
+            pairs = [
+                (rid, meta or {})
+                for rid, meta in zip(results.get('ids') or [], results.get('metadatas') or [])
+                if bool((meta or {}).get('isDeleted')) != value
+            ]
+            if not pairs:
                 continue
-            metadatas = [{**(meta or {}), 'isDeleted': value} for meta in results['metadatas']]
+            ids = [rid for rid, _meta in pairs]
+            metadatas = [{**meta, 'isDeleted': value} for _rid, meta in pairs]
             for start in range(0, len(ids), 1000):
                 self.collectionObj.update(ids=ids[start : start + 1000], metadatas=metadatas[start : start + 1000])
+            moved += len(ids)
+        return moved
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """

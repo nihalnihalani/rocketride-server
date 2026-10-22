@@ -862,47 +862,58 @@ class Store(DocumentStoreBase):
         self.collectionObj.data.delete_many(where=Filter.any_of(objectIdsFilter))
         return
 
-    def _setDeleted(self, objectIds: List[str], value: bool) -> None:
+    def _setDeleted(self, objectIds: List[str], deleted: bool) -> None:
         """
         Set ``isDeleted`` on every chunk of ``objectIds``.
 
         Reads the chunks still in the other state a page at a time (a query without a limit
         returns only the server's default of 10 objects); each update takes a chunk out of
-        the next read, and a page of chunks already updated ends the loop.
+        the next read, and a page of chunks already updated ends the loop. Same name,
+        arguments and return as #2704's helper, so either copy serves both callers.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
         if not objectIds or not self.doesCollectionExist():
             return
 
-        pending = _all(_any_equal('objectId', list(objectIds)), Filter.by_property('isDeleted').equal(not value))
+        pending = _all(_any_equal('objectId', list(objectIds)), Filter.by_property('isDeleted').equal(not deleted))
         done = set()
         while True:
             points = self.collectionObj.query.fetch_objects(filters=pending, limit=UPDATE_PAGE).objects
             fresh = [point for point in points if str(point.uuid) not in done]
             for point in fresh:
                 done.add(str(point.uuid))
-                self.collectionObj.data.update(uuid=point.uuid, properties={'isDeleted': value})
+                self.collectionObj.data.update(uuid=point.uuid, properties={'isDeleted': deleted})
             if not fresh or len(points) < UPDATE_PAGE:
                 return
 
     @_backend_errors('markDeleted')
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the chunks moved to the trash, counted before the update.
         """
+        if not objectIds or not self.doesCollectionExist():
+            return 0
+        moving = self.vxChunksInState(objectIds, deleted=False)
         self._setDeleted(objectIds, True)
+        return moving
 
     @_backend_errors('markActive')
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+        Returns the chunks taken out of the trash, counted before the update.
         """
+        if not objectIds or not self.doesCollectionExist():
+            return 0
+        moving = self.vxChunksInState(objectIds, deleted=True)
         self._setDeleted(objectIds, False)
+        return moving
 
     @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:

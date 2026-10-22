@@ -756,17 +756,19 @@ class Store(DocumentStoreBase):
 
     def updateRecords(
         self, objectIds: List[str], metadataUpdates: Dict[str, Any] = None, isDeleteOperation: bool = False
-    ) -> None:
+    ) -> int:
         """
         Collect the ids of records in a list of objectIds to update or delete the records.
+
+        Returns the records whose metadata the call changed (0 for a delete, which Pinecone does not count).
         """
         if not objectIds:
-            return
+            return 0
 
         # By definition, if the collection does not exists, there
         # is nothing to update
         if not self.doesCollectionExist():
-            return
+            return 0
 
         # Getting index
         index = self.client.Index(self.collection)
@@ -775,10 +777,10 @@ class Store(DocumentStoreBase):
         # Deleting if we need to fully remove documents
         if isDeleteOperation:
             index.delete(filter=object_ids_filter)
-            return
+            return 0
 
         if not metadataUpdates:
-            return
+            return 0
 
         vector_size = int(index.describe_index_stats()['dimension'])
         batch_size = 1000
@@ -795,6 +797,7 @@ class Store(DocumentStoreBase):
         }
 
         # Updating the metadata fields we want changed for the batch update
+        changed = 0
         while True:
             records = index.query(
                 vector=[1] * vector_size,
@@ -809,9 +812,10 @@ class Store(DocumentStoreBase):
             batch_ids = [record['id'] for record in records]
             for id_to_update in batch_ids:
                 index.update(id=id_to_update, set_metadata=metadataUpdates)
+            changed += len(batch_ids)
             if len(batch_ids) < batch_size:
                 break
-        return
+        return changed
 
     @_backend_errors('remove')
     def remove(self, objectIds: List[str]) -> None:
@@ -822,24 +826,24 @@ class Store(DocumentStoreBase):
         return
 
     @_backend_errors('markDeleted')
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the records moved to the trash.
         """
-        self.updateRecords(objectIds, {'isDeleted': True})
-        return
+        return self.updateRecords(objectIds, {'isDeleted': True})
 
     @_backend_errors('markActive')
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> int:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+        Returns the records taken out of the trash.
         """
-        self.updateRecords(objectIds, {'isDeleted': False})
-        return
+        return self.updateRecords(objectIds, {'isDeleted': False})
 
     @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:

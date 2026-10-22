@@ -218,19 +218,24 @@ class DocumentStoreBase(ABC):
         """
 
     @abstractmethod
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the number of chunks the call moved to the trash (0 for a document already
+        there or not stored), or None when the backend cannot count; the ``soft_delete``
+        tool answers it as ``matched_chunks``.
         """
 
     @abstractmethod
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+        Returns the number of chunks the call took out of the trash (0 for a document not
+        in it), or None when the backend cannot count; ``restore`` answers it.
         """
 
     @abstractmethod
@@ -316,6 +321,19 @@ class DocumentStoreBase(ABC):
         state = self.__dict__.get('_vx_state')
         if state is not None:
             state.forget_counts()
+
+    def vxChunksInState(self, objectIds: Sequence[str], deleted: bool) -> Optional[int]:
+        """Count the chunks of ``objectIds`` in the trash (``deleted``) or out of it, through :meth:`countChunks`.
+
+        A driver whose update does not report what it changed counts the chunks a
+        ``markDeleted`` (``deleted=False``) or ``markActive`` (``deleted=True``) is about to
+        move, so both return a count. None when the driver cannot count with a filter.
+        """
+        ids = [str(oid) for oid in objectIds or [] if str(oid) != CONTROL_OBJECT_ID]
+        if not ids:
+            return 0
+        count = self.countChunks(deletedFilter('deleted' if deleted else 'active', objectIds=ids))
+        return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
 
     def vxStoresExtras(self) -> bool:
         """Return whether this driver stores the explorer's metadata extras.

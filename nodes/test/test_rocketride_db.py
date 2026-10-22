@@ -831,6 +831,24 @@ class TestPgVectorTransactions:
         assert samples and all('hashtextextended("id"::text, %s)' in text for text in samples)
         assert not [text for text in _statements(mock_rv) if 'setseed' in text or 'random()' in text]
 
+    def test_mark_deleted_and_active_return_the_chunks_they_moved(self, mock_rv):
+        """One UPDATE over the rows in the other state; its row count is soft_delete's matched_chunks."""
+        from ai.common.schema import DocFilter
+
+        store = _make_store(mock_rv, {'collection': 'rr_vec', 'similarity': 'cosine'})
+        store.addChunks([_doc('a', c, [1, 0, 0, 0, c]) for c in range(3)] + [_doc('b', 0, [0, 1, 0, 0, 0])])
+        assert store.markDeleted(['a', 'ghost']) == 3
+        assert store.markDeleted(['a']) == 0, 'already in the trash: nothing moves'
+        assert store.markActive(['a', 'b']) == 3, 'b was never in the trash'
+        assert store.markActive(['a']) == 0
+        assert store.markDeleted([]) == 0
+        assert store.countChunks(DocFilter()) == 4
+        for row in mock_rv.db.table('rr_vec').rows.values():
+            if row['objectid'] == 'b':
+                row['isdeleted'] = None  # NULL reads as active: restoring it moves nothing
+        assert store.markActive(['b']) == 0
+        assert store.markDeleted(['b']) == 1
+
     def test_rows_with_a_null_deleted_flag_read_as_active(self, mock_rv):
         from ai.common.schema import DocFilter
 
