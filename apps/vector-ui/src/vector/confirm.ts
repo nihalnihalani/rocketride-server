@@ -212,7 +212,7 @@ export interface IRemovalOutcome {
  * Remove documents batch by batch, stopping at the first error. Never retried.
  *
  * @param ids - The objectIds.
- * @param call - Sends one batch (`remove_document`) and reads its answer.
+ * @param call - Sends one batch (`delete`) and reads its answer.
  * @param size - The batch size (the node's write_ids_max).
  * @returns What ran.
  */

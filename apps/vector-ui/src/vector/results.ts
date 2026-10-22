@@ -37,7 +37,7 @@
 //   - A missing collection keeps the legacy success envelope
 //     (`count: 0, model: '', vector_size: 0, collection_exists: false`): '' is
 //     no model and 0 is no dimension.
-//   - `documents` is a LIST page; a dict is refused. The control record
+//   - `list_documents` is a LIST page; a dict is refused. The control record
 //     (`schema`) is never listed, whatever a node sends.
 //   - A number that is not a finite number is no count (null).
 // =============================================================================
@@ -203,6 +203,8 @@ export interface IStatsView {
 	withoutFirstChunk: number | null;
 	chunks: number | null;
 	deleted: number | null;
+	/** Documents with a chunk in the trash (the Trash listing's size), or null where the store cannot count. */
+	deletedDocuments: number | null;
 	rawCount: number | null;
 	tables: number | null;
 	avgPerDocument: number | null;
@@ -234,6 +236,7 @@ export function readStats(value: Record<string, unknown>): IStatsView {
 		withoutFirstChunk: count(value.documents_without_first_chunk),
 		chunks: count(value.chunks),
 		deleted: count(value.deleted_chunks),
+		deletedDocuments: count(value.deleted_documents),
 		rawCount: count(value.raw_count),
 		tables: count(value.tables),
 		avgPerDocument: count(value.avg_chunks_per_document),
@@ -251,7 +254,7 @@ export function readStats(value: Record<string, unknown>): IStatsView {
 // DOCUMENTS
 // =============================================================================
 
-/** A `documents` page as the directory reads it. */
+/** A `list_documents` page as the directory reads it. */
 export interface IDocumentsPageView {
 	items: IDocumentItem[];
 	nextCursor: string | null;
@@ -299,14 +302,14 @@ function readDocument(raw: unknown): IDocumentItem | null {
 }
 
 /**
- * Read a `documents` success answer.
+ * Read a `list_documents` success answer.
  *
  * @param value - The answer (already unwrapped).
  * @returns The page.
  */
 export function readDocumentsPage(value: Record<string, unknown>): IDocumentsPageView {
 	if (!Array.isArray(value.items)) {
-		throw new ExplorerToolError({ kind: 'malformed', tool: 'documents', message: 'documents answered without a list: items must be a list of documents' });
+		throw new ExplorerToolError({ kind: 'malformed', tool: 'list_documents', message: 'list_documents answered without a list: items must be a list of documents' });
 	}
 	const caveats = strings(value.caveats);
 	return {
@@ -361,27 +364,51 @@ export function readChunksPage(value: Record<string, unknown>): IChunksPageView 
 }
 
 // =============================================================================
-// REMOVE
+// WRITES
 // =============================================================================
 
-/** A `remove_document` answer. */
+/** A `delete` answer, per document. `delete` names no removed rows, so a document's own chunk count is unknown (null). */
 export interface IRemoveView {
 	removed: Array<{ objectId: string; chunks: number | null }>;
 	notFound: string[];
+	/** With `deleted_only`: documents left untouched because a chunk of them is live. */
+	keptLive: string[];
 	/** Rows the node says it removed; null when it could not count them. */
 	removedChunks: number | null;
 }
 
 /**
- * Read a `remove_document` success answer.
+ * Read a `delete` success answer for the batch it answers.
  *
  * @param value - The answer (already unwrapped).
- * @returns What was removed, exactly as the node reported it.
+ * @param sent - The objectIds of the batch: those neither not found nor kept live were removed.
+ * @returns What was removed, as the node reported it.
  */
-export function readRemoveResult(value: Record<string, unknown>): IRemoveView {
-	const removed = (Array.isArray(value.removed) ? value.removed : [])
-		.filter(isPlainObject)
-		.map((row) => ({ objectId: str(row.objectId) ?? '', chunks: count(row.chunks_removed) }))
-		.filter((row) => row.objectId !== '');
-	return { removed, notFound: strings(value.not_found), removedChunks: count(value.removed_chunks) };
+export function readDeleteResult(value: Record<string, unknown>, sent: readonly string[]): IRemoveView {
+	const notFound = strings(value.not_found);
+	const keptLive = strings(value.kept_live);
+	const left = new Set([...notFound, ...keptLive]);
+	const removed = [...new Set(sent)].filter((objectId) => objectId !== '' && !left.has(objectId)).map((objectId) => ({ objectId, chunks: null }));
+	return { removed, notFound, keptLive, removedChunks: count(value.removed_chunks) };
+}
+
+/** A `soft_delete` or `restore` answer. */
+export interface ITrashView {
+	/** The documents asked for that are stored (distinct, in request order). */
+	moved: string[];
+	notFound: string[];
+	/** The chunks the call moved; null when the store cannot count them. */
+	matchedChunks: number | null;
+}
+
+/**
+ * Read a `soft_delete` or `restore` success answer.
+ *
+ * @param value - The answer (already unwrapped).
+ * @returns What it moved into or out of the trash.
+ */
+export function readTrashResult(value: Record<string, unknown>): ITrashView {
+	const notFound = strings(value.not_found);
+	const gone = new Set(notFound);
+	return { moved: [...new Set(strings(value.object_ids))].filter((objectId) => !gone.has(objectId)), notFound, matchedChunks: count(value.matched_chunks) };
 }

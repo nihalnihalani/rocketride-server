@@ -30,7 +30,7 @@ Conventions:
   `sample_listing_truncated.json` a sample whose document listing stopped at
   500 of 600 documents.
 - The additive answers of the contract's section 4.4 are hand-written:
-  `documents_filter_{server,partial,client}.json` (a filtered `documents`
+  `list_documents_filter_{server,partial,client}.json` (a filtered `list_documents`
   page as pgvector, the pgvector legacy table and Qdrant answer it),
   `recommend_ok.json`, `recommend_unsupported.json`,
   `similarity_matrix_ok.json` and `dialect_enriched.json` (a node that offers

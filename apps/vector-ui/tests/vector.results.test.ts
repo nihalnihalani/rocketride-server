@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import { ExplorerToolError } from 'shared/explorer';
-import { DEFAULT_LIMITS, readChunksPage, readDialect, readDocumentsPage, readRemoveResult, readStats, unwrapEnvelope } from '../src/vector/results';
+import { DEFAULT_LIMITS, readChunksPage, readDeleteResult, readDialect, readDocumentsPage, readStats, readTrashResult, unwrapEnvelope } from '../src/vector/results';
 import { fixture } from './support/fixtures';
 import defaults from './fixtures/defaults.json';
 
@@ -119,21 +119,21 @@ test('readStats: figures a store cannot count stay null; quick answers carry cou
 });
 
 test('readDocumentsPage: a list page with its cursor, order and caveats; never the control record', () => {
-	const page = readDocumentsPage(fixture('documents_page1'));
+	const page = readDocumentsPage(fixture('list_documents_page1'));
 	assert.equal(page.items.length, 5);
 	assert.equal(typeof page.nextCursor, 'string');
 	assert.equal(page.total, 7);
 	assert.equal(page.sorted, true);
 	assert.equal(page.pagingUnsupported, false);
-	const unsorted = readDocumentsPage(fixture('documents_unsorted'));
+	const unsorted = readDocumentsPage(fixture('list_documents_unsorted'));
 	assert.equal(unsorted.sorted, false);
 	assert.equal(unsorted.total, null);
 	assert.ok(unsorted.caveats.includes('documents_unsorted'));
-	const stuck = readDocumentsPage(fixture('documents_paging_unsupported'));
+	const stuck = readDocumentsPage(fixture('list_documents_paging_unsupported'));
 	assert.equal(stuck.pagingUnsupported, true);
 	assert.equal(stuck.nextCursor, null);
 	assert.equal(stuck.items[0].chunks, null);
-	const withControl = fixture('documents_page2_last');
+	const withControl = fixture('list_documents_page2_last');
 	withControl.items.push({ ...withControl.items[0], objectId: 'schema', path: 'schema' });
 	assert.ok(!readDocumentsPage(withControl).items.some((item) => item.objectId === 'schema'), 'the control record is never listed');
 });
@@ -163,12 +163,36 @@ test('readChunksPage: chunks in order, never a vector; the existence probe reads
 	assert.equal(caught(() => unwrapEnvelope('chunks', fixture('chunks_not_found'))).code, 'NOT_FOUND');
 });
 
-test('readRemoveResult: rows actually removed, the ids not found, and nothing the node did not say', () => {
-	const ok = readRemoveResult(fixture('remove_document_ok'));
+test('readDeleteResult: the batch less what was not found or kept live, and nothing the node did not say', () => {
+	const kestrel = fixture('delete_ok').audit.object_ids[0];
+	const ok = readDeleteResult(fixture('delete_ok'), [kestrel]);
 	assert.equal(ok.removedChunks, 12);
-	assert.deepEqual(ok.removed, [{ objectId: fixture('remove_document_ok').removed[0].objectId, chunks: 12 }]);
-	assert.deepEqual(ok.notFound, []);
-	const unknown = readRemoveResult({ success: true, removed: [{ objectId: 'a', chunks_removed: null }], not_found: ['b'], removed_chunks: null });
+	assert.deepEqual(ok.removed, [{ objectId: kestrel, chunks: null }], "delete names no rows per document: each one's count is unknown");
+	assert.deepEqual([ok.notFound, ok.keptLive], [[], []]);
+	const unknown = readDeleteResult({ success: true, deleted_count: 2, not_found: ['b'], removed_chunks: null }, ['a', 'b', 'a']);
 	assert.equal(unknown.removedChunks, null, 'a store that cannot count says so; the app does not add up');
-	assert.deepEqual(unknown.notFound, ['b']);
+	assert.deepEqual([unknown.removed.map((r) => r.objectId), unknown.notFound, unknown.keptLive], [['a'], ['b'], []], 'each id once; an answer without kept_live keeps nothing');
+	const emptied = readDeleteResult(fixture('delete_deleted_only'), fixture('delete_deleted_only').audit.object_ids);
+	assert.deepEqual(
+		emptied.removed.map((r) => r.objectId),
+		[kestrel]
+	);
+	assert.deepEqual(emptied.keptLive, fixture('delete_deleted_only').kept_live, 'a partly trashed document is reported, not removed');
+});
+
+test('readTrashResult: soft_delete and restore say which documents moved and how many chunks', () => {
+	for (const name of ['soft_delete_ok', 'restore_ok']) {
+		const view = readTrashResult(fixture(name));
+		assert.deepEqual([view.moved, view.notFound, view.matchedChunks], [fixture(name).object_ids, [], 12], name);
+	}
+	const mixed = readTrashResult({ success: true, object_ids: ['a', 'b', 'a'], not_found: ['b'], matched_chunks: null });
+	assert.deepEqual([mixed.moved, mixed.notFound, mixed.matchedChunks], [['a'], ['b'], null]);
+});
+
+test('readStats: deleted_documents is the Trash count, null where the store cannot count', () => {
+	assert.equal(readStats(fixture('stats_pgvector')).deletedDocuments, 0);
+	assert.equal(readStats({ ...fixture('stats_pgvector'), deleted_documents: 3 }).deletedDocuments, 3);
+	assert.equal(readStats(fixture('stats_collection_missing_legacy')).deletedDocuments, null);
+	assert.equal(readStats({ success: true, count: 4, model: 'm', vector_size: 8 }).deletedDocuments, null, 'an older node has no Trash count');
+	assert.equal(caught(() => unwrapEnvelope('chunks', fixture('chunks_in_trash'))).code, 'IN_TRASH');
 });

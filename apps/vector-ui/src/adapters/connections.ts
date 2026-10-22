@@ -52,7 +52,7 @@ import { CHUNKS_PAGE } from '../vector/budgets';
 import { createConsoleStore } from '../vector/consoleStore';
 import type { IConsoleClock, IConsoleStore } from '../vector/consoleStore';
 import { DEFAULT_LIMITS } from '../vector/results';
-import { fetchChunks, fetchDocumentsPage, fetchStats, removeDocumentsBatch } from './actions';
+import { deleteBatch, fetchChunks, fetchDocumentsPage, fetchStats } from './actions';
 import { announcer, connectionCaches, vectorEndpoints } from './explorer';
 
 /** A tiny external store of one value (useSyncExternalStore-compatible). */
@@ -138,9 +138,9 @@ function makeController(entry: Pick<IConnectionEntry, 'ctx' | 'selection'>, cloc
 	return createConsoleStore(
 		{
 			stats: (mode) => fetchStats(session('stats'), ctx.endpoint.nodeId, mode),
-			documents: (cursor, limit, filter) => fetchDocumentsPage(session('documents'), ctx.endpoint.nodeId, { cursor, limit }, {}, filter),
+			documents: (cursor, limit, filter) => fetchDocumentsPage(session('list_documents'), ctx.endpoint.nodeId, { cursor, limit }, {}, filter),
 			chunks: (objectId, afterChunk, limit) => fetchChunks(session('chunks'), ctx.endpoint.nodeId, { objectId, afterChunk, limit }),
-			remove: (ids) => removeDocumentsBatch(session('remove_document'), ctx.endpoint.nodeId, ids),
+			remove: (ids) => deleteBatch(session('delete'), ctx.endpoint.nodeId, ids),
 			announce: (text) => announcer.announce(text),
 			onRemoved: (ids) => {
 				for (const id of ids) entry.selection.forgetDocument(id);

@@ -79,7 +79,7 @@ test('the view calls embed at one place, never vectors, and sends a query vector
 
 test('the map never calls a write tool: removals are asked of the console, which confirms them', () => {
 	const sources = [...mapFiles.map((f) => read(`map/${f}`)), read('views/MapView.tsx'), ...MAP_COMPONENTS.map((n) => read(`components/${n}.tsx`))];
-	for (const text of sources) assert.doesNotMatch(text, /'remove_document'|'delete'|'upsert'/);
+	for (const text of sources) assert.doesNotMatch(text, /'remove_document'|'delete'|'soft_delete'|'restore'|'upsert'/);
 	assert.match(read('views/MapView.tsx'), /actions\.requestRemove\(/);
 });
 

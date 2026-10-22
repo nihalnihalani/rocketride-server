@@ -606,5 +606,5 @@ test('queue: a failed upload reads honestly and is not counted as added', async 
 	assert.equal(rows['bad.pdf'].detail, 'Pipe closed with an error');
 	assert.equal(rows['good.md'].status, 'done');
 	assert.deepEqual(h.changed.flat(), [objectIdForPath('good.md')]);
-	assert.ok(!h.calls.some((call) => call.tool === 'documents' && (call.input.object_ids as string[])[0] === objectIdForPath('bad.pdf')));
+	assert.ok(!h.calls.some((call) => call.tool === 'list_documents' && (call.input.object_ids as string[])[0] === objectIdForPath('bad.pdf')));
 });

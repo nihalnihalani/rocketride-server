@@ -307,7 +307,7 @@ test('selection rows: one row per selected key, in the Selection tab order, a ke
 });
 
 test('document rows: the frozen column set and the loaded rows as the directory holds them', () => {
-	const items = fixture<{ items: IDocumentItem[] }>('documents_page1').items;
+	const items = fixture<{ items: IDocumentItem[] }>('list_documents_page1').items;
 	const rows = documentRows(items);
 	assert.deepEqual([...rows.columns], [...EXPORT_COLUMNS.documents]);
 	assert.equal(rows.rows.length, items.length);
@@ -401,7 +401,7 @@ test('the map toolbar items: sample, lasso selection, visible points, clusters, 
 });
 
 test('the directory items: the loaded documents, and the scope when one applies', () => {
-	const items = fixture<{ items: IDocumentItem[] }>('documents_page1').items;
+	const items = fixture<{ items: IDocumentItem[] }>('list_documents_page1').items;
 	const plain = documentExportItems({ rows: items, scoped: null });
 	assert.deepEqual(
 		plain.map((i) => [i.id, i.kind, i.disabled]),

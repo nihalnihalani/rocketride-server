@@ -38,9 +38,9 @@ import { groupOf, groups, pairsAt } from '../src/map/dedupe';
 import type { IDuplicateGroup } from '../src/map/dedupe';
 import { DEFAULT_LIMITS, readDialect, readDocumentsPage } from '../src/vector/results';
 import dialectEnriched from './fixtures/provisional/dialect_enriched.json';
-import filterClient from './fixtures/provisional/documents_filter_client.json';
-import filterPartial from './fixtures/provisional/documents_filter_partial.json';
-import filterServer from './fixtures/provisional/documents_filter_server.json';
+import filterClient from './fixtures/provisional/list_documents_filter_client.json';
+import filterPartial from './fixtures/provisional/list_documents_filter_partial.json';
+import filterServer from './fixtures/provisional/list_documents_filter_server.json';
 import recommendOk from './fixtures/provisional/recommend_ok.json';
 import recommendUnsupported from './fixtures/provisional/recommend_unsupported.json';
 import matrixOk from './fixtures/provisional/similarity_matrix_ok.json';
@@ -57,9 +57,9 @@ type Widen<T> = T extends string ? string : T extends number ? number : T extend
 
 // Compile-time: every required key is there with the right kind (tsc fails otherwise).
 const typed: Array<[string, unknown]> = [
-	['documents_filter_server', filterServer satisfies Widen<IDocumentsResult>],
-	['documents_filter_partial', filterPartial satisfies Widen<IDocumentsResult>],
-	['documents_filter_client', filterClient satisfies Widen<IDocumentsResult>],
+	['list_documents_filter_server', filterServer satisfies Widen<IDocumentsResult>],
+	['list_documents_filter_partial', filterPartial satisfies Widen<IDocumentsResult>],
+	['list_documents_filter_client', filterClient satisfies Widen<IDocumentsResult>],
 	['recommend_ok', recommendOk satisfies Widen<IRecommendResult>],
 	['recommend_unsupported', recommendUnsupported satisfies Widen<IToolFailure>],
 	['similarity_matrix_ok', matrixOk satisfies Widen<ISimilarityMatrixResult>],
@@ -112,9 +112,9 @@ test('every new fixture is checked against its type at compile time', () => {
 
 test('documents with a filter: exactly the documents keys, filter_applied from the vocabulary, the health fields on the items', () => {
 	const cases: Array<[string, IDocumentsResult, string]> = [
-		['documents_filter_server', fixture('documents_filter_server'), 'server'],
-		['documents_filter_partial', fixture('documents_filter_partial'), 'partial'],
-		['documents_filter_client', fixture('documents_filter_client'), 'none'],
+		['list_documents_filter_server', fixture('list_documents_filter_server'), 'server'],
+		['list_documents_filter_partial', fixture('list_documents_filter_partial'), 'partial'],
+		['list_documents_filter_client', fixture('list_documents_filter_client'), 'none'],
 	];
 	for (const [name, page, applied] of cases) {
 		exactKeys(page, DOCUMENTS_KEYS, ['warnings'], name);
@@ -124,12 +124,12 @@ test('documents with a filter: exactly the documents keys, filter_applied from t
 		for (const key of page.filter_ignored ?? []) assert.ok((DOCUMENTS_FILTER_KEYS as readonly string[]).includes(key), `${name}: ${key} is a filter key`);
 		for (const caveat of page.caveats) assert.ok((CAVEATS as readonly string[]).includes(caveat), `${name}: ${caveat}`);
 	}
-	assert.deepEqual(fixture<IDocumentsResult>('documents_filter_server').filter_ignored, []);
-	assert.ok(fixture<IDocumentsResult>('documents_filter_partial').caveats.includes('documents_filter_partial'));
-	assert.ok(fixture<IDocumentsResult>('documents_filter_client').caveats.includes('documents_filter_client'));
+	assert.deepEqual(fixture<IDocumentsResult>('list_documents_filter_server').filter_ignored, []);
+	assert.ok(fixture<IDocumentsResult>('list_documents_filter_partial').caveats.includes('documents_filter_partial'));
+	assert.ok(fixture<IDocumentsResult>('list_documents_filter_client').caveats.includes('documents_filter_client'));
 	// Stores that do not compute the health fields answer null for both.
-	for (const item of fixture<IDocumentsResult>('documents_filter_client').items) assert.deepEqual([item.max_chunk_id, item.deleted_chunks], [null, null]);
-	assert.equal(fixture<IDocumentsResult>('documents_filter_partial').items[0]?.deleted_chunks, 1);
+	for (const item of fixture<IDocumentsResult>('list_documents_filter_client').items) assert.deepEqual([item.max_chunk_id, item.deleted_chunks], [null, null]);
+	assert.equal(fixture<IDocumentsResult>('list_documents_filter_partial').items[0]?.deleted_chunks, 1);
 });
 
 test('recommend: exactly its keys, neighbour rows, a strategy from the vocabulary; the refusal is a failure envelope', () => {
@@ -278,15 +278,15 @@ test('the export column sets are words, never a vector', () => {
 // =============================================================================
 
 test('the readers keep the additive keys only when a node sends them', () => {
-	const server = readDocumentsPage(fixture('documents_filter_server'));
+	const server = readDocumentsPage(fixture('list_documents_filter_server'));
 	assert.equal(server.filterApplied, 'server');
 	assert.deepEqual(server.filterIgnored, []);
 	assert.equal(server.items[0]?.max_chunk_id, 5);
 	assert.equal(server.items[0]?.deleted_chunks, 0);
-	const partial = readDocumentsPage(fixture('documents_filter_partial'));
+	const partial = readDocumentsPage(fixture('list_documents_filter_partial'));
 	assert.equal(partial.filterApplied, 'partial');
 	assert.deepEqual(partial.filterIgnored, ['ingested_after']);
-	const old = readDocumentsPage(fixture('documents_page1'));
+	const old = readDocumentsPage(fixture('list_documents_page1'));
 	assert.equal('filterApplied' in old, false, 'an answer without a filter says nothing about one');
 	assert.equal('max_chunk_id' in (old.items[0] as object), false);
 	const enriched = readDialect(fixture('dialect_enriched'));
@@ -302,7 +302,7 @@ test('the readers keep the additive keys only when a node sends them', () => {
 
 test('fetchDocumentsPage sends a filter only when one is given', async () => {
 	const sent: Array<Record<string, unknown>> = [];
-	const caller = { invoke: async (_tool: string, input: Record<string, unknown> = {}) => (sent.push(input), fixture('documents_filter_server')) };
+	const caller = { invoke: async (_tool: string, input: Record<string, unknown> = {}) => (sent.push(input), fixture('list_documents_filter_server')) };
 	await fetchDocumentsPage(caller, 'store_1', { cursor: null, limit: 200 });
 	await fetchDocumentsPage(caller, 'store_1', { cursor: null, limit: 200 }, {}, null);
 	const page = await fetchDocumentsPage(caller, 'store_1', { cursor: 'c', limit: 50 }, {}, { path_prefix: 'C:/demo/greenhouse/', file_types: ['pdf', 'txt'] });

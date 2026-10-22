@@ -44,7 +44,7 @@
 //     of kind `store` that KEEPS the code, so the console can say which
 //     refusal it was. The probe does the same for `dialect`.
 //   - Reads are idempotent (a lost TASK_STOPPED may be retried once);
-//     `remove_document`, `delete` and `upsert` never are.
+//     the writes (`delete`, `soft_delete`, `restore`, `upsert`) never are.
 //   - Budgets derive from the node's published statement deadline (pgvector)
 //     plus the session pad; `sample` waits for its own node budget.
 //
@@ -74,15 +74,18 @@ export const VECTOR_PROVIDERS: ReadonlySet<string> = new Set(['postgres', 'rocke
 export const TOOL = {
 	dialect: 'dialect',
 	stats: 'stats',
-	documents: 'documents',
+	// The listing (the tool was `documents`; #2704's name): `deleted: 'deleted'` lists the trash.
+	listDocuments: 'list_documents',
 	chunks: 'chunks',
 	vectors: 'vectors',
 	sample: 'sample',
 	project: 'project',
 	neighbors: 'neighbors',
 	search: 'search',
-	removeDocument: 'remove_document',
+	// The writes: delete is the only permanent delete; soft_delete moves to the trash and restore back out of it.
 	delete: 'delete',
+	softDelete: 'soft_delete',
+	restore: 'restore',
 	upsert: 'upsert',
 	embed: EMBED_TOOL,
 	// Additive tools (contract section 4.4): reads that return keys and scalars, never a stored vector.
@@ -91,7 +94,7 @@ export const TOOL = {
 } as const;
 
 /** The tools that change data. Never idempotent, never replayed, never called without a confirmation. */
-export const WRITE_TOOLS: ReadonlySet<string> = new Set([TOOL.removeDocument, TOOL.delete, TOOL.upsert]);
+export const WRITE_TOOLS: ReadonlySet<string> = new Set([TOOL.delete, TOOL.softDelete, TOOL.restore, TOOL.upsert]);
 
 /** Client wait for `sample` when the node does not publish its budget: the node's 60 s plus the pad. */
 const SAMPLE_TIMEOUT_MS = 70_000;
@@ -120,7 +123,7 @@ export function makeVectorTools(): Readonly<Record<string, IToolSpec>> {
 		[TOOL.dialect]: read(undefined, DEFAULT_TOOL_TIMEOUTS.dialect),
 		// Legacy descriptor: every node answers it, so no capability is required.
 		[TOOL.stats]: read(),
-		[TOOL.documents]: read('documents'),
+		[TOOL.listDocuments]: read('documents'),
 		[TOOL.chunks]: read('chunks'),
 		[TOOL.vectors]: read('vectors'),
 		[TOOL.sample]: read('sample', SAMPLE_TIMEOUT_MS),
@@ -132,8 +135,10 @@ export function makeVectorTools(): Readonly<Record<string, IToolSpec>> {
 		// sample's keys (cached, else from the store). A node older than these tools answers that it has none.
 		[TOOL.recommend]: read('neighbors'),
 		[TOOL.similarityMatrix]: read('sample'),
-		[TOOL.removeDocument]: write('remove'),
 		[TOOL.delete]: write(),
+		// Moving to the trash and back needs the driver's markDeleted / markActive (dialect.capabilities.soft_delete).
+		[TOOL.softDelete]: write('soft_delete'),
+		[TOOL.restore]: write('soft_delete'),
 		[TOOL.upsert]: write(),
 	};
 }

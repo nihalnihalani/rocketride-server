@@ -27,8 +27,9 @@
 // Every call names its node (the store node, or the embedding node for
 // `embed`) and unwraps the answer: a success comes back read by
 // vector/results.ts, a failure envelope rejects as an ExplorerToolError of
-// kind `store` that keeps its code. Writes go through `removeDocumentsBatch`
-// only, once per batch, never retried (the tool table marks them so).
+// kind `store` that keeps its code. Writes go through the batch calls below
+// (`trashBatch`, `restoreBatch`, `deleteBatch`), once per batch, never retried
+// (the tool table marks them so).
 // =============================================================================
 
 import { ExplorerToolError } from 'shared/explorer';
@@ -36,8 +37,8 @@ import type { IExplorerClient, IExplorerEndpoint, IEndpointStore, IInvokeOptions
 import type { IDocumentsFilter, IEmbedResult, INeighborsScopeResult, VectorChannels, VectorKey } from '../contract/types';
 import { heatScores } from '../vector/heat';
 import type { IHeatScore } from '../vector/heat';
-import { readChunksPage, readDocumentsPage, readRemoveResult, readStats, unwrapEnvelope } from '../vector/results';
-import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView } from '../vector/results';
+import { readChunksPage, readDeleteResult, readDocumentsPage, readStats, readTrashResult, unwrapEnvelope } from '../vector/results';
+import type { IChunksPageView, IDocumentsPageView, IRemoveView, IStatsView, ITrashView } from '../vector/results';
 import { TOOL } from './explorer';
 
 /** What can call a tool: a session (the anchor token) or a role channel. */
@@ -74,7 +75,7 @@ export async function fetchStats(caller: IVectorCaller, nodeId: string, mode: 'f
 }
 
 /**
- * One page of `documents` (active documents, path order), optionally filtered.
+ * One page of `list_documents` (path order), optionally filtered: the active documents, or the trash.
  *
  * @param caller - A session or channel.
  * @param nodeId - The store node.
@@ -82,12 +83,13 @@ export async function fetchStats(caller: IVectorCaller, nodeId: string, mode: 'f
  * @param opts - Per-call options.
  * @param filter - The directory's conditions (contract section 4.4-A), sent only when given; the answer says
  *   how much of it the store applied (`filterApplied`), and an older node ignores it.
+ * @param deleted - 'active' (the default) or 'deleted': the documents with a chunk in the trash.
  * @returns The page.
  */
-export async function fetchDocumentsPage(caller: IVectorCaller, nodeId: string, page: { cursor: string | null; limit: number }, opts: IInvokeOptions = {}, filter?: IDocumentsFilter | null): Promise<IDocumentsPageView> {
-	const input: Record<string, unknown> = { cursor: page.cursor, limit: page.limit, deleted: 'active', sort: 'path' };
+export async function fetchDocumentsPage(caller: IVectorCaller, nodeId: string, page: { cursor: string | null; limit: number }, opts: IInvokeOptions = {}, filter?: IDocumentsFilter | null, deleted: 'active' | 'deleted' = 'active'): Promise<IDocumentsPageView> {
+	const input: Record<string, unknown> = { cursor: page.cursor, limit: page.limit, deleted, sort: 'path' };
 	if (filter) input.filter = { ...filter };
-	return readDocumentsPage(await callVector(caller, nodeId, TOOL.documents, input, opts));
+	return readDocumentsPage(await callVector(caller, nodeId, TOOL.listDocuments, input, opts));
 }
 
 /**
@@ -123,15 +125,42 @@ export async function chunkCount(caller: IVectorCaller, nodeId: string, objectId
 }
 
 /**
- * Remove one batch of documents (the gated write). Sent once; never retried.
+ * Delete one batch of documents permanently (`delete`, the gated write). Sent once; never retried.
  *
  * @param caller - A session or channel.
  * @param nodeId - The store node.
  * @param objectIds - At most write_ids_max objectIds.
- * @returns What the node removed.
+ * @param opts - `deletedOnly`: remove a document only when every chunk of it is in the trash (Empty trash).
+ * @returns What the node removed, and what it kept because a chunk of it is live.
  */
-export async function removeDocumentsBatch(caller: IVectorCaller, nodeId: string, objectIds: readonly string[]): Promise<IRemoveView> {
-	return readRemoveResult(await callVector(caller, nodeId, TOOL.removeDocument, { object_ids: [...objectIds] }, { idempotent: false }));
+export async function deleteBatch(caller: IVectorCaller, nodeId: string, objectIds: readonly string[], opts: { deletedOnly?: boolean } = {}): Promise<IRemoveView> {
+	const input: Record<string, unknown> = { object_ids: [...objectIds] };
+	if (opts.deletedOnly) input.deleted_only = true;
+	return readDeleteResult(await callVector(caller, nodeId, TOOL.delete, input, { idempotent: false }), objectIds);
+}
+
+/**
+ * Move one batch of documents to the trash (`soft_delete`). Sent once; never retried.
+ *
+ * @param caller - A session or channel.
+ * @param nodeId - The store node.
+ * @param objectIds - At most write_ids_max objectIds.
+ * @returns What it moved.
+ */
+export async function trashBatch(caller: IVectorCaller, nodeId: string, objectIds: readonly string[]): Promise<ITrashView> {
+	return readTrashResult(await callVector(caller, nodeId, TOOL.softDelete, { object_ids: [...objectIds] }, { idempotent: false }));
+}
+
+/**
+ * Restore one batch of documents from the trash (`restore`). Sent once; never retried.
+ *
+ * @param caller - A session or channel.
+ * @param nodeId - The store node.
+ * @param objectIds - At most write_ids_max objectIds.
+ * @returns What it moved back.
+ */
+export async function restoreBatch(caller: IVectorCaller, nodeId: string, objectIds: readonly string[]): Promise<ITrashView> {
+	return readTrashResult(await callVector(caller, nodeId, TOOL.restore, { object_ids: [...objectIds] }, { idempotent: false }));
 }
 
 /**
@@ -200,7 +229,7 @@ export function vectorChannels(store: Pick<IEndpointStore, 'channel'>, client: I
 }
 
 /**
- * One document's directory row (`documents` with `object_ids`), or null when it is not stored.
+ * One document's directory row (`list_documents` with `object_ids`), or null when it is not stored.
  *
  * @param caller - A session or channel.
  * @param nodeId - The store node.
@@ -208,6 +237,6 @@ export function vectorChannels(store: Pick<IEndpointStore, 'channel'>, client: I
  * @returns The row, or null.
  */
 export async function fetchDocument(caller: IVectorCaller, nodeId: string, objectId: string): Promise<IDocumentsPageView['items'][number] | null> {
-	const page = readDocumentsPage(await callVector(caller, nodeId, TOOL.documents, { cursor: null, limit: 1, object_ids: [objectId], deleted: 'all', sort: 'path' }));
+	const page = readDocumentsPage(await callVector(caller, nodeId, TOOL.listDocuments, { cursor: null, limit: 1, object_ids: [objectId], deleted: 'all', sort: 'path' }));
 	return page.items.find((item) => item.objectId === objectId) ?? null;
 }

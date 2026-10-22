@@ -24,7 +24,7 @@ function doc(objectId: string, path: string, over: Partial<IDocumentItem> = {}):
 }
 
 /** The Windows, POSIX, share and bare-name rows. */
-const PATHS: IDocumentItem[] = readDocumentsPage(fixture('documents_windows_and_posix_paths')).items;
+const PATHS: IDocumentItem[] = readDocumentsPage(fixture('list_documents_windows_and_posix_paths')).items;
 
 /** The paths of the rows a wire filter matches. */
 function pathsOf(rows: readonly IDocumentItem[], filter: IDocumentsFilter, keys?: readonly string[]): string[] {
@@ -368,7 +368,7 @@ test("the stats strip's scope line counts documents against the store's figure a
 // =============================================================================
 
 test('a server-filtered listing: the scope is every listed document once the listing settles, null while it loads', () => {
-	const server = readDocumentsPage(fixture('documents_filter_server'));
+	const server = readDocumentsPage(fixture('list_documents_filter_server'));
 	const filter = { path_prefix: 'C:/demo/greenhouse/' };
 	const loading = pagerBegin(pagerInit(), filter);
 	assert.equal(resolveScope(scopeOf(filter), loading, 2_000).objectIds, null, 'unresolved while the first page is on its way');
@@ -385,26 +385,26 @@ test('a server-filtered listing: the scope is every listed document once the lis
 
 test("a partial answer: the store's rows are filtered here by the keys it skipped", () => {
 	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/handbooks/', ingested_after: '2026-10-01T00:00:00Z' };
-	const done = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage(fixture('documents_filter_partial')));
+	const done = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage(fixture('list_documents_filter_partial')));
 	assert.deepEqual(done.filterIgnored, ['ingested_after']);
 	assert.deepEqual(resolveScope(scopeOf(filter), done, 2_000).objectIds, [], 'the legacy row has no ingest time, so it cannot be shown to match');
 });
 
 test('a store that filters nothing (none, or an older node that ignores the filter): the loaded rows are matched here', () => {
 	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] };
-	const none = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage({ ...fixture('documents_filter_client'), next_cursor: null }));
+	const none = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage({ ...fixture('list_documents_filter_client'), next_cursor: null }));
 	assert.equal(none.filterApplied, 'none');
 	const falcon = none.rows.filter((r) => r.path === 'C:/demo/handbooks/falcon_handbook.md').map((r) => r.objectId);
 	assert.equal(falcon.length, 1);
 	assert.deepEqual(resolveScope(scopeOf(filter), none, 2_000).objectIds, falcon);
-	const old = listed(readDocumentsPage(fixture('documents_page1')).items, filter);
+	const old = listed(readDocumentsPage(fixture('list_documents_page1')).items, filter);
 	assert.equal(old.filterApplied, 'none', 'an answer without filter_applied came from a node that ignored the filter');
 	assert.deepEqual(old.filterIgnored, ['path_prefix', 'file_types']);
 	assert.deepEqual(resolveScope(scopeOf(filter), old, 2_000).objectIds, falcon);
 });
 
 test('the Documents toggle off: the directory lists everything and the scope is matched here over the loaded rows', () => {
-	const rows = readDocumentsPage(fixture('documents_page1')).items;
+	const rows = readDocumentsPage(fixture('list_documents_page1')).items;
 	const dir = listed(rows, null);
 	const scope = scopeOf({ path_prefix: 'C:/demo/greenhouse/' }, { documents: false });
 	assert.deepEqual(resolveScope(scope, dir, 2_000).objectIds?.length, 2);
@@ -413,7 +413,7 @@ test('the Documents toggle off: the directory lists everything and the scope is 
 
 test('the path box goes to the store with the conditions: the store counts it when it applied it, else it is matched here', () => {
 	const filter: IDocumentsFilter = { path_prefix: 'C:/demo/greenhouse/', path_contains: 'TXT' };
-	const rows = readDocumentsPage(fixture('documents_filter_server')).items;
+	const rows = readDocumentsPage(fixture('list_documents_filter_server')).items;
 	const txt = rows.filter((r) => r.path.endsWith('.txt'));
 	assert.equal(txt.length, 1);
 	assert.deepEqual(clientKeys(filter, 'server', []), [], 'the store applied every key, the path box among them');
@@ -509,7 +509,7 @@ test('before the store answers for a scope: no word about what it applies and no
 	assert.equal(directoryView(loading, scopeOf(filter, { documents: false }), 'fal', 2_000).summary, 'Loading the documents in scope…');
 	for (const words of [pending.summary, scopeStripText(view, stats), directoryView(failed, scope, 'fal', 2_000).summary]) assert.doesNotMatch(words ?? '', /cannot filter|at least|0 of 0/);
 	// Once the store answers, its own words: 'none' keeps its sentence, 'server' counts.
-	const none = pagerApplyPage(loading, readDocumentsPage({ ...fixture('documents_filter_client'), next_cursor: null }));
+	const none = pagerApplyPage(loading, readDocumentsPage({ ...fixture('list_documents_filter_client'), next_cursor: null }));
 	assert.equal(none.filterApplied, 'none');
 	assert.match(directoryView(none, scope, 'fal', 2_000).summary ?? '', /\(filtered here; the store cannot filter by these\)$/);
 	const server = pagerApplyPage(loading, readDocumentsPage({ success: true, items: [], next_cursor: null, total: 0, counts_exact: true, distinct: true, sorted: true, caveats: [], filter_applied: 'server', filter_ignored: [] }));
@@ -628,7 +628,7 @@ test("the directory's empty text says when only the loaded documents were matche
 });
 
 test("the directory's export: 'Documents in scope' holds the scope's own documents whatever the Documents toggle, and says when it is only the loaded ones", () => {
-	const all = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	const all = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_page1'))), readDocumentsPage(fixture('list_documents_page2_last')));
 	assert.equal(all.status, 'done');
 	assert.equal(all.rows.length, 7);
 	const filter = { path_prefix: 'C:/demo/greenhouse/' };
@@ -653,14 +653,14 @@ test("the directory's export: 'Documents in scope' holds the scope's own documen
 	assert.ok(inScope(offRows), 'every exported row is in the scope');
 	assert.equal(offScope.disabled, null);
 	// The toggle on, the store applied the scope: the same 2.
-	const server = listed(readDocumentsPage(fixture('documents_filter_server')).items, filter, { filter_applied: 'server', filter_ignored: [] });
+	const server = listed(readDocumentsPage(fixture('list_documents_filter_server')).items, filter, { filter_applied: 'server', filter_ignored: [] });
 	const onScope = item(directoryExportItems(server, directoryView(server, scopeOf(filter), '', 2_000)), 'directory-scope');
 	assert.equal(onScope.label, 'Documents in scope (2)');
 	assert.ok(inScope(onScope.rows?.().rows ?? []));
 	// The toggle just turned on, the list not yet listed again: every document is loaded, so the match is the whole scope.
 	assert.equal(item(directoryExportItems(all, directoryView(all, scopeOf(filter), '', 2_000)), 'directory-scope').label, 'Documents in scope (2)');
 	// A finished listing for other conditions: its matches are only part of the scope.
-	const other = listed(readDocumentsPage(fixture('documents_filter_server')).items, { path_prefix: 'C:/demo/' }, { filter_applied: 'server', filter_ignored: [] });
+	const other = listed(readDocumentsPage(fixture('list_documents_filter_server')).items, { path_prefix: 'C:/demo/' }, { filter_applied: 'server', filter_ignored: [] });
 	assert.equal(item(directoryExportItems(other, directoryView(other, scopeOf(filter), '', 2_000)), 'directory-scope').label, 'Loaded documents in scope (2)');
 	// The store has not answered for the scope yet: nothing to export under its name.
 	const loading = pagerBegin(pagerInit(), filter);
@@ -691,7 +691,7 @@ test('above the cap: overflow with the count (from the store total when it said)
 });
 
 test('a scope is resolved only from the listing it asked for: a stale listing (the list not yet re-listed) resolves nothing', () => {
-	const rows = readDocumentsPage(fixture('documents_page1')).items;
+	const rows = readDocumentsPage(fixture('list_documents_page1')).items;
 	const unfiltered = listed(rows, null);
 	const scope = scopeOf({ path_prefix: 'C:/demo/greenhouse/' });
 	const stale = resolveScope(scope, unfiltered, 2_000);

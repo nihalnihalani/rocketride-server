@@ -66,9 +66,9 @@ test('the caveat sentences the console shows', () => {
 });
 
 test('a refused write reads as its sentence, not as the raw envelope', () => {
-	for (const name of ['remove_document_writes_disabled', 'remove_document_writes_source', 'remove_document_unknown_caller', 'remove_document_reserved_id']) {
+	for (const name of ['delete_writes_disabled', 'delete_writes_source', 'delete_unknown_caller', 'delete_reserved_id']) {
 		const envelope = fixture(name);
-		const error = new ExplorerToolError({ kind: 'store', tool: 'remove_document', message: envelope.error, code: envelope.code });
+		const error = new ExplorerToolError({ kind: 'store', tool: 'delete', message: envelope.error, code: envelope.code });
 		const text = failureText(error, { write: true });
 		assert.ok(text, name);
 		assert.equal(text.headline, codeSentence(envelope.code), name);
@@ -85,7 +85,7 @@ test("a read failure leads with the sentence and keeps the node's own words as d
 });
 
 test('a write the app stopped waiting for may still complete; a read timeout says it stopped waiting; a dropped result says nothing', () => {
-	const timeout = new ExplorerToolError({ kind: 'timeout', tool: 'remove_document', message: 'Stopped waiting for remove_document after 40 s. The node may still be running it; there is no way to cancel it from here.' });
+	const timeout = new ExplorerToolError({ kind: 'timeout', tool: 'delete', message: 'Stopped waiting for delete after 40 s. The node may still be running it; there is no way to cancel it from here.' });
 	assert.deepEqual(failureText(timeout, { write: true }), { headline: WRITE_TIMEOUT_TEXT });
 	assert.equal(WRITE_TIMEOUT_TEXT, 'The request may still complete on the server. Refresh to check.');
 	const readTimeout = new ExplorerToolError({ kind: 'timeout', tool: 'stats', message: 'Stopped waiting for stats after 40 s. The node may still be running it; there is no way to cancel it from here.' });

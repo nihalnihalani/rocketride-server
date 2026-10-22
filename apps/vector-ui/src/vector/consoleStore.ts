@@ -84,7 +84,7 @@ export interface IConsoleDeps {
 	/** One directory page; `filter` (the scope's conditions) is passed to the node when given. */
 	documents(cursor: string | null, limit: number, filter?: IDocumentsFilter | null): Promise<IDocumentsPageView>;
 	chunks(objectId: string, afterChunk: number, limit: number): Promise<IChunksPageView>;
-	/** One remove_document batch. */
+	/** One `delete` batch (the permanent delete). */
 	remove(objectIds: string[]): Promise<IRemoveView>;
 	/** Speak a short outcome through the polite live region. */
 	announce(text: string): void;

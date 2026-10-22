@@ -99,5 +99,11 @@
 		"success": false,
 		"code": "READS_PUBLIC",
 		"error": "The store refused this request."
+	},
+	"IN_TRASH": {
+		"success": false,
+		"code": "IN_TRASH",
+		"error": "chunks: the document 'doc00' is in the trash; restore it to read it",
+		"object_id": "doc00"
 	}
 }

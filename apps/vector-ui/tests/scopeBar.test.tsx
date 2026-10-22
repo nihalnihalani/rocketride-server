@@ -85,7 +85,7 @@ test('no scope: the bar is one row (snapshot), the path box its first field, not
 });
 
 test("the directory header with no scope: the title row, then the bar's one row, then the list", () => {
-	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_page1'))), readDocumentsPage(fixture('list_documents_page2_last')));
 	assert.equal(pager.status, 'done');
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
 	const start = html.indexOf('<div data-component="ScopeBar">');
@@ -183,7 +183,7 @@ test('Save opens a name box (the scope must have a condition)', () => {
 
 test('the directory with a scope: its status line says what the store applied', () => {
 	const filter = { path_prefix: 'C:/demo/greenhouse/' };
-	const pager = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage(fixture('documents_filter_server')));
+	const pager = pagerApplyPage(pagerBegin(pagerInit(), filter), readDocumentsPage(fixture('list_documents_filter_server')));
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf(filter)} onScope={noop} />);
 	assert.match(html, /role="status"[^>]*>2 documents match \(store\)</);
 	assert.match(html, /aria-label="Remove condition: folder is under C:\/demo\/greenhouse\/"/);

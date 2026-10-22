@@ -23,7 +23,7 @@ import { dedupeView, docInfo, queueInit, queueReducer, queued } from '../src/map
 import { MULTI_REMOVE_LIST_MAX } from '../src/vector/budgets';
 import { createConsoleStore } from '../src/vector/consoleStore';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
-import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
+import { readChunksPage, readDocumentsPage, readDeleteResult, readStats } from '../src/vector/results';
 import { loadSample } from './support/map.samples';
 import { fixture } from './support/fixtures';
 import { REMOVE_CANCEL_LABEL, batches, confirmReady, multiRemoveConfirmation, removalSummary, removeConfirmation, runRemoval } from '../src/vector/confirm';
@@ -93,7 +93,7 @@ test('runRemoval: every batch in order, rows as the node reported them', async (
 		['a', 'b', 'c'],
 		async (batch) => {
 			sent.push(batch);
-			return { removed: batch.filter((id) => id !== 'c').map((objectId) => ({ objectId, chunks: 2 })), notFound: batch.filter((id) => id === 'c'), removedChunks: 2 * batch.filter((id) => id !== 'c').length } satisfies IRemoveView;
+			return { removed: batch.filter((id) => id !== 'c').map((objectId) => ({ objectId, chunks: 2 })), notFound: batch.filter((id) => id === 'c'), keptLive: [], removedChunks: 2 * batch.filter((id) => id !== 'c').length } satisfies IRemoveView;
 		},
 		2
 	);
@@ -115,8 +115,8 @@ test('runRemoval stops at the first error and says what already ran; a count the
 		['a', 'b', 'c', 'd'],
 		async (batch) => {
 			sent.push(batch);
-			if (batch[0] === 'c') throw new ExplorerToolError({ kind: 'store', tool: 'remove_document', message: 'Removing documents is turned off', code: 'WRITES_DISABLED' });
-			return { removed: batch.map((objectId) => ({ objectId, chunks: null })), notFound: [], removedChunks: null };
+			if (batch[0] === 'c') throw new ExplorerToolError({ kind: 'store', tool: 'delete', message: 'Removing documents is turned off', code: 'WRITES_DISABLED' });
+			return { removed: batch.map((objectId) => ({ objectId, chunks: null })), notFound: [], keptLive: [], removedChunks: null };
 		},
 		2
 	);
@@ -175,11 +175,11 @@ function consoleWith(rows: IDocumentItem[], writeBatch: number) {
 	const clock = manualClock(Date.parse('2026-10-15T09:00:00Z'));
 	const deps: IConsoleDeps = {
 		stats: async () => readStats(fixture('stats_pgvector')),
-		documents: async () => readDocumentsPage({ ...fixture('documents_page2_last'), items: rows }),
+		documents: async () => readDocumentsPage({ ...fixture('list_documents_page2_last'), items: rows }),
 		chunks: async () => readChunksPage(fixture('chunks_page')),
 		remove: async (ids) => {
 			sent.push([...ids]);
-			return readRemoveResult({ ...fixture('remove_document_ok'), removed: ids.map((objectId) => ({ objectId, chunks_removed: 3 })), removed_chunks: 3 * ids.length });
+			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 3 * ids.length }, ids);
 		},
 		announce: () => undefined,
 		clock,

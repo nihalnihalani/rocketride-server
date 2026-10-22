@@ -60,6 +60,8 @@ export const TOOL_CODES = [
 	'INVALID_INPUT',
 	'UNSUPPORTED',
 	'NOT_FOUND',
+	// chunks / get: every chunk of the document is in the trash (restore it to read it).
+	'IN_TRASH',
 	'RESERVED_ID',
 	'COLLECTION_MISSING',
 	'STORE_ERROR',
@@ -144,15 +146,17 @@ export type CapabilityKey = (typeof CAPABILITY_KEYS)[number];
 export const VECTOR_STORE_TOOLS = [
 	'dialect',
 	'stats',
-	'documents',
+	'list_documents',
 	'chunks',
 	'vectors',
 	'sample',
 	'project',
 	'neighbors',
 	'search',
-	'remove_document',
+	// The writes: delete is the only permanent delete; soft_delete and restore move documents into and out of the trash.
 	'delete',
+	'soft_delete',
+	'restore',
 	'upsert',
 	'get',
 	'objdir',
@@ -337,6 +341,8 @@ export interface IStatsResult {
 	documents_without_first_chunk?: number | null;
 	chunks?: number | null;
 	deleted_chunks?: number | null;
+	/** Documents with at least one chunk in the trash (the Trash listing's size); null where the store cannot count. */
+	deleted_documents?: number | null;
 	raw_count?: number | null;
 	tables?: number | null;
 	avg_chunks_per_document?: number | null;
@@ -384,13 +390,18 @@ export const DOCUMENTS_FILTER_KEYS = ['path_prefix', 'file_types', 'ingested_aft
 /** `documents.filter_applied`: the store applied every given key, some of them, or none (the app filters the loaded rows itself). */
 export type FilterApplied = 'server' | 'partial' | 'none';
 
-/** `documents` input. */
+/**
+ * `list_documents` input (the tool was `documents`). `deleted: 'deleted'` is the Trash view: documents with at
+ * least one chunk in the trash. #2704's callers may also send `deleted: true | false` and an exact `parent`.
+ */
 export interface IDocumentsInput {
 	cursor?: string | null;
 	/** Clamped to `limits.documents_page` (answer then carries warnings ['limit_clamped']). */
 	limit?: number;
 	object_ids?: string[] | null;
-	deleted?: Deleted;
+	deleted?: Deleted | boolean;
+	/** The exact stored path (#2704's filter); `total` is then null and a page can be short. */
+	parent?: string;
 	sort?: 'path';
 	/** Section 4.4-A; an older node ignores it (the answer then carries no `filter_applied`). */
 	filter?: IDocumentsFilter | null;
@@ -417,7 +428,7 @@ export interface IDocumentItem {
 	deleted_chunks?: number | null;
 }
 
-/** `documents` answer (a list page, never a dict). */
+/** `list_documents` answer (a list page, never a dict). */
 export interface IDocumentsResult {
 	success: true;
 	items: IDocumentItem[];
@@ -839,31 +850,39 @@ export interface IWriteAudit {
 	caller: { auth: string; userId?: string | null; teamId?: string | null };
 }
 
-/** `remove_document` input (1..write_ids_max ids). */
-export interface IRemoveDocumentInput {
+/** `soft_delete` and `restore` input (1..write_ids_max ids for the app). */
+export interface ISoftDeleteInput {
 	object_ids: string[];
 }
 
-/** `remove_document` answer. */
-export interface IRemoveDocumentResult {
+/**
+ * `soft_delete` (move to the trash) and `restore` (back out of it) answer. `matched_chunks` counts the chunks
+ * the call moved (0 for a document already in that state), or null where the store cannot count; a restore of
+ * a document that is not in the trash changes nothing for it. `audit.action` is `vector.soft_delete` or
+ * `vector.restore`.
+ */
+export interface ISoftDeleteResult {
 	success: true;
-	removed: Array<{ objectId: string; chunks_removed: number | null }>;
+	/** The ids asked for, distinct, in request order. */
+	object_ids: string[];
+	matched_chunks: number | null;
 	not_found: string[];
-	removed_chunks: number | null;
 	audit: IWriteAudit;
 }
 
-/** `delete` (legacy) input. */
+/** `delete` input: the only permanent delete. `deleted_only` removes a document only when every chunk of it is in the trash. */
 export interface IDeleteInput {
 	object_ids: string[];
+	deleted_only?: boolean;
 }
 
-/** `delete` (legacy) answer, extended. */
+/** `delete` answer. `kept_live`: with `deleted_only`, the documents left untouched because a chunk of them is live ([] otherwise). */
 export interface IDeleteResult {
 	success: true;
 	deleted_count: number;
 	removed_chunks?: number | null;
 	not_found?: string[];
+	kept_live?: string[];
 	audit?: IWriteAudit;
 }
 
@@ -939,15 +958,16 @@ export interface IEmbedResult {
 export interface VectorToolMap {
 	dialect: { input: Record<string, never>; result: IDialectResult };
 	stats: { input: IStatsInput; result: IStatsResult };
-	documents: { input: IDocumentsInput; result: IDocumentsResult };
+	list_documents: { input: IDocumentsInput; result: IDocumentsResult };
 	chunks: { input: IChunksInput; result: IChunksResult };
 	vectors: { input: IVectorsInput; result: IVectorsResult };
 	sample: { input: ISampleInput; result: ISampleResult };
 	project: { input: IProjectInput; result: IProjectResult };
 	neighbors: { input: INeighborsInput; result: INeighborsResult | INeighborsScopeResult };
 	search: { input: ISearchInput; result: ISearchResult };
-	remove_document: { input: IRemoveDocumentInput; result: IRemoveDocumentResult };
 	delete: { input: IDeleteInput; result: IDeleteResult };
+	soft_delete: { input: ISoftDeleteInput; result: ISoftDeleteResult };
+	restore: { input: ISoftDeleteInput; result: ISoftDeleteResult };
 	upsert: { input: IUpsertInput; result: IUpsertResult };
 	get: { input: IGetInput; result: IGetResult };
 	objdir: { input: IObjdirInput; result: IObjdirResult };

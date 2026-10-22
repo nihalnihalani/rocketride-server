@@ -322,7 +322,7 @@ test('queue: dispose in the middle of an upload forgets everything and ignores t
 	await new Promise((resolve) => setTimeout(resolve, 5));
 	assert.deepEqual(queue.getState().rows, []);
 	assert.deepEqual(fake.changed, []);
-	assert.equal(fake.tools.filter((tool) => tool === 'documents').length, 0);
+	assert.equal(fake.tools.filter((tool) => tool === 'list_documents').length, 0);
 	queue.handleEvent({ action: 'write', filepath: 'a.md', bytes_sent: 1, file_size: 1, upload_time: 0 });
 	assert.deepEqual(queue.getState().rows, []);
 	await queue.addDrop([candidate('b.md')]);

@@ -22,7 +22,7 @@ import { pagerApplyPage, pagerBegin, pagerFail, pagerFooter, pagerInit } from '.
 import { directoryView, scopeStripText } from '../src/vector/filters';
 import { DEFAULT_LIMITS } from '../src/vector/results';
 import type { IConsoleDeps } from '../src/vector/consoleStore';
-import { readChunksPage, readDocumentsPage, readRemoveResult, readStats } from '../src/vector/results';
+import { readChunksPage, readDocumentsPage, readDeleteResult, readStats } from '../src/vector/results';
 import type { IDocumentsPageView } from '../src/vector/results';
 import { BUSY, CANCELLED_TEXT, CODE_SENTENCES } from '../src/vector/wording';
 import { fixture } from './support/fixtures';
@@ -50,15 +50,15 @@ function harness(over: Partial<IConsoleDeps> = {}) {
 		},
 		documents: async (cursor, limit) => {
 			calls.push({ tool: 'documents', args: [cursor, limit] });
-			return readDocumentsPage(cursor ? fixture('documents_page2_last') : fixture('documents_page1'));
+			return readDocumentsPage(cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1'));
 		},
 		chunks: async (objectId, after, limit) => {
 			calls.push({ tool: 'chunks', args: [objectId, after, limit] });
 			return readChunksPage(fixture('chunks_page'));
 		},
 		remove: async (ids) => {
-			calls.push({ tool: 'remove_document', args: [ids] });
-			return readRemoveResult({ ...fixture('remove_document_ok'), removed: ids.map((objectId) => ({ objectId, chunks_removed: 12 })), removed_chunks: 12 * ids.length });
+			calls.push({ tool: 'delete', args: [ids] });
+			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 12 * ids.length }, ids);
 		},
 		announce: (text) => announced.push(text),
 		onRemoved: (ids) => removedIds.push([...ids]),
@@ -78,7 +78,7 @@ test('opening the console: a full stats call and the directory loading every pag
 		[
 			['stats', 'full'],
 			['documents', null, 500],
-			['documents', readDocumentsPage(fixture('documents_page1')).nextCursor, 500],
+			['documents', readDocumentsPage(fixture('list_documents_page1')).nextCursor, 500],
 		]
 	);
 	const state = store.getState();
@@ -210,9 +210,9 @@ test('a refresh while pages arrive starts over, and a late page of the old listi
 			if (cursor !== null && first) {
 				first = false;
 				await new Promise<void>((resolve) => (release = resolve));
-				return { ...readDocumentsPage(fixture('documents_page2_last')), items: [doc('late', 'late.md')] };
+				return { ...readDocumentsPage(fixture('list_documents_page2_last')), items: [doc('late', 'late.md')] };
 			}
-			return readDocumentsPage(cursor ? fixture('documents_page2_last') : fixture('documents_page1'));
+			return readDocumentsPage(cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1'));
 		},
 	});
 	store.open();
@@ -232,7 +232,7 @@ test('a failed page stops the listing with the reason; Retry asks for the same c
 		documents: async (cursor, limit) => {
 			calls.push({ tool: 'documents', args: [cursor, limit] });
 			if (cursor !== null && fail) throw new ExplorerToolError({ kind: 'timeout', tool: 'documents', message: 'Stopped waiting for documents after 40 s.' });
-			return readDocumentsPage(cursor ? fixture('documents_page2_last') : fixture('documents_page1'));
+			return readDocumentsPage(cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1'));
 		},
 	});
 	store.open();
@@ -313,11 +313,11 @@ test('remove: asking opens the confirmation and sends nothing; Cancel sends noth
 	await clock.settle();
 	store.requestRemove([{ objectId: 'kestrel', path: 'C:/demo/field/kestrel_field_guide.md', chunks: 12 }]);
 	assert.equal(store.getState().confirm?.targets.length, 1);
-	assert.ok(!tools().includes('remove_document'), 'nothing is sent before Confirm');
+	assert.ok(!tools().includes('delete'), 'nothing is sent before Confirm');
 	store.cancelRemove();
 	await clock.settle();
 	assert.equal(store.getState().confirm, null);
-	assert.ok(!tools().includes('remove_document'), 'Cancel sends nothing');
+	assert.ok(!tools().includes('delete'), 'Cancel sends nothing');
 	assert.deepEqual(announced, [CANCELLED_TEXT]);
 	assert.equal(store.getState().removal.message, CANCELLED_TEXT);
 	store.dispose();
@@ -335,7 +335,7 @@ test('remove: Confirm sends the batch once, announces the rows removed, refreshe
 	await store.confirmRemove();
 	await clock.settle();
 	assert.deepEqual(calls.map((c) => [c.tool, ...c.args]).slice(0, 2), [
-		['remove_document', ['kestrel']],
+		['delete', ['kestrel']],
 		['stats', 'full'],
 	]);
 	assert.ok(
@@ -354,7 +354,7 @@ test('remove: refused by the node, the sentence names the rule; with writes off 
 	const { store, clock, announced } = harness({
 		remove: async () => {
 			sent += 1;
-			throw new ExplorerToolError({ kind: 'store', tool: 'remove_document', message: 'Only a Tools source may remove documents.', code: 'WRITES_SOURCE' });
+			throw new ExplorerToolError({ kind: 'store', tool: 'delete', message: 'Only a Tools source may remove documents.', code: 'WRITES_SOURCE' });
 		},
 	});
 	store.setWritesEnabled(true);
@@ -382,7 +382,7 @@ test('remove: while a removal runs no second confirmation opens and nothing more
 			maxInFlight = Math.max(maxInFlight, inFlight);
 			await new Promise<void>((resolve) => (release = resolve));
 			inFlight -= 1;
-			return readRemoveResult({ ...fixture('remove_document_ok'), removed: ids.map((objectId) => ({ objectId, chunks_removed: 2 })), removed_chunks: 2 * ids.length });
+			return readDeleteResult({ ...fixture('delete_ok'), removed_chunks: 2 * ids.length }, ids);
 		},
 	});
 	store.setWritesEnabled(true);
@@ -412,8 +412,8 @@ test('several documents go in batches of write_ids_max and stop at the first err
 	const { store, clock, announced } = harness({
 		remove: async (ids) => {
 			sent.push([...ids]);
-			if (sent.length === 2) throw new ExplorerToolError({ kind: 'store', tool: 'remove_document', message: 'x', code: 'WRITES_DISABLED' });
-			return readRemoveResult({ success: true, removed: ids.map((objectId) => ({ objectId, chunks_removed: 1 })), not_found: [], removed_chunks: ids.length });
+			if (sent.length === 2) throw new ExplorerToolError({ kind: 'store', tool: 'delete', message: 'x', code: 'WRITES_DISABLED' });
+			return readDeleteResult({ success: true, deleted_count: ids.length, not_found: [], kept_live: [], removed_chunks: ids.length }, ids);
 		},
 	});
 	store.setWritesEnabled(true);
@@ -435,13 +435,13 @@ test('several documents go in batches of write_ids_max and stop at the first err
 // =============================================================================
 
 /** A harness whose documents call records the filter and answers with a filtered fixture when given one. */
-function scoped(answer: string = 'documents_filter_server') {
+function scoped(answer: string = 'list_documents_filter_server') {
 	const filters: Array<IDocumentsFilter | null | undefined> = [];
 	const h = harness({
 		documents: async (cursor, limit, filter) => {
 			filters.push(filter);
 			if (filter) return readDocumentsPage(fixture(answer));
-			return readDocumentsPage(cursor ? fixture('documents_page2_last') : fixture('documents_page1'));
+			return readDocumentsPage(cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1'));
 		},
 	});
 	return { ...h, filters };
@@ -477,7 +477,7 @@ test("the pager sends the scope's conditions; a new filter lists again from the 
 test('the path box with the scope: a store that filters by it lists again; one that skips it keeps the rows it listed', async () => {
 	// pgvector answers 'server': the box is the store's to apply.
 	{
-		const { store, clock, filters } = scoped('documents_filter_server');
+		const { store, clock, filters } = scoped('list_documents_filter_server');
 		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
 		store.setFilter(greenhouse);
 		store.open();
@@ -489,7 +489,7 @@ test('the path box with the scope: a store that filters by it lists again; one t
 	}
 	// A store that filters nothing ('none') would list the same rows for any text: they are kept, under the new filter.
 	{
-		const { store, clock, filters } = scoped('documents_filter_client');
+		const { store, clock, filters } = scoped('list_documents_filter_client');
 		const handbooks = { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] };
 		store.setFilter(handbooks);
 		store.open();
@@ -519,7 +519,7 @@ test('the path box with the scope: a store that filters by it lists again; one t
 			documents: async (_cursor, _limit, filter) => {
 				filters.push(filter);
 				const skipped = filter?.path_contains != null;
-				return readDocumentsPage({ ...fixture('documents_filter_server'), filter_applied: skipped ? 'partial' : 'server', filter_ignored: skipped ? ['path_contains'] : [], caveats: skipped ? ['documents_filter_partial'] : [] });
+				return readDocumentsPage({ ...fixture('list_documents_filter_server'), filter_applied: skipped ? 'partial' : 'server', filter_ignored: skipped ? ['path_contains'] : [], caveats: skipped ? ['documents_filter_partial'] : [] });
 			},
 		});
 		const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
@@ -559,9 +559,9 @@ test("a filter set before the console opens is the first listing's; a removal li
 test("the directory's status line says how much the store applied: server, partial, or here over what is loaded", async () => {
 	const scope = (filter: IDocumentsFilter, documents = true): IScopeState => ({ filter, label: '', objectIds: null, overflow: null, applyTo: { documents, map: true, search: true, chat: true } });
 	const cases: Array<[string, IDocumentsFilter, string]> = [
-		['documents_filter_server', { path_prefix: 'C:/demo/greenhouse/' }, '2 documents match (store)'],
-		['documents_filter_partial', { path_prefix: 'C:/demo/handbooks/', ingested_after: '2026-10-01T00:00:00Z' }, '0 documents match (store; ingest dates filtered here)'],
-		['documents_filter_client', { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] }, '1 of 3 loaded match (filtered here; the store cannot filter by these)'],
+		['list_documents_filter_server', { path_prefix: 'C:/demo/greenhouse/' }, '2 documents match (store)'],
+		['list_documents_filter_partial', { path_prefix: 'C:/demo/handbooks/', ingested_after: '2026-10-01T00:00:00Z' }, '0 documents match (store; ingest dates filtered here)'],
+		['list_documents_filter_client', { path_prefix: 'C:/demo/handbooks/', file_types: ['md'] }, '1 of 3 loaded match (filtered here; the store cannot filter by these)'],
 	];
 	for (const [answer, filter, words] of cases) {
 		const { store, clock } = scoped(answer);
@@ -585,7 +585,7 @@ test("the directory's status line says how much the store applied: server, parti
 });
 
 test('typing in the path box on a store that applies it: between the listings the line says the scope is loading, never that the store cannot filter', async () => {
-	const { store, clock, filters } = scoped('documents_filter_server');
+	const { store, clock, filters } = scoped('list_documents_filter_server');
 	const greenhouse = { path_prefix: 'C:/demo/greenhouse/' };
 	let filter: IDocumentsFilter = greenhouse;
 	let text = '';
@@ -635,7 +635,7 @@ test("a scope's first page fails: no status line about the store (the footer's e
 	const { store, clock } = harness({
 		documents: async (_cursor, _limit, filter) => {
 			if (filter && fail) throw new ExplorerToolError({ kind: 'timeout', tool: 'documents', message: 'Stopped waiting for documents after 40 s.' });
-			return readDocumentsPage(filter ? fixture('documents_filter_server') : fixture('documents_page1'));
+			return readDocumentsPage(filter ? fixture('list_documents_filter_server') : fixture('list_documents_page1'));
 		},
 	});
 	const scope: IScopeState = { filter: greenhouse, label: '', objectIds: null, overflow: null, applyTo: { documents: true, map: true, search: true, chat: true } };

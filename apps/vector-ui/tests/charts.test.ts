@@ -97,7 +97,7 @@ test("chunk length: from the map's sample (its pinned points left out), with the
 });
 
 test('file types from Windows, POSIX, share and bare names; the most common first; a click scopes to the type', () => {
-	const rows = readDocumentsPage(fixture('documents_windows_and_posix_paths')).items;
+	const rows = readDocumentsPage(fixture('list_documents_windows_and_posix_paths')).items;
 	const bins = byFileType(rows);
 	assert.deepEqual(
 		bins.map((b) => [b.label, b.count]),
@@ -210,7 +210,7 @@ test('long spans step up to quarters and years, never past the cap, and every pe
 });
 
 test('the four charts: their states (disabled under extras_not_stored, partial coverage, loading), sources and coverage', () => {
-	const rows = readDocumentsPage(fixture('documents_page1')).items;
+	const rows = readDocumentsPage(fixture('list_documents_page1')).items;
 	const pg = readDialect(fixture('dialect_pgvector'));
 	const charts = collectionCharts({ rows, total: 42, sample: null, dialect: pg, loading: true });
 	assert.deepEqual(

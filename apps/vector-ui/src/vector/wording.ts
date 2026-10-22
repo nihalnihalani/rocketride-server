@@ -49,6 +49,7 @@ export const CODE_SENTENCES: Readonly<Record<ToolCode, string>> = {
 	INVALID_INPUT: 'The store node did not accept the input of this request.',
 	UNSUPPORTED: 'This store cannot do that.',
 	NOT_FOUND: 'That document is not stored in this collection.',
+	IN_TRASH: 'This document is in the trash. Restore it to read it.',
 	RESERVED_ID: "That record is the collection's control record and cannot be removed.",
 	COLLECTION_MISSING: 'The collection does not exist yet; add a document to create it.',
 	STORE_ERROR: 'The store answered with an error.',
@@ -142,7 +143,7 @@ export interface IFailureText {
  * What a failed call says on screen.
  *
  * @param error - Whatever the call rejected with.
- * @param ctx - `write: true` for remove_document / delete / upsert.
+ * @param ctx - `write: true` for delete / soft_delete / restore / upsert.
  * @returns The text, or null for a dropped (stale) result, which is never shown.
  */
 export function failureText(error: unknown, ctx: { write?: boolean } = {}): IFailureText | null {

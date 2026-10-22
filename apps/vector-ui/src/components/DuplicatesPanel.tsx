@@ -36,7 +36,7 @@
 // A group inside one document is listed apart with Open only.
 //
 // Removing is the console's: the queued objectIds go to the host's batched
-// remove, which confirms with the typed count and sends `remove_document`
+// remove, which confirms with the typed count and sends `delete`
 // at most `write_ids_max` at a time, stopping at the first error. Without
 // writes the radios and every Remove are disabled with the reason as text.
 // The reviewed documents are the connection's 'reviewed documents' cache.

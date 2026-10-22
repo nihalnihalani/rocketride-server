@@ -179,7 +179,7 @@ test("every removal is confirmed by the app-level host, with Cancel focused by t
 	assert.match(host, /entry\.controller\.confirmRemove\(\)/);
 	assert.match(host, /entry\.controller\.cancelRemove\(\)/);
 	for (const file of ['components/DocumentRow.tsx', 'views/DocumentView.tsx', 'components/DocumentDirectory.tsx', 'views/ConsoleView.tsx']) {
-		assert.doesNotMatch(code(file), /removeDocumentsBatch|remove_document/, `${file} never removes on its own`);
+		assert.doesNotMatch(code(file), /\b(deleteBatch|trashBatch|restoreBatch)\b|'(remove_document|delete|soft_delete|restore)'/, `${file} never writes on its own`);
 	}
 });
 

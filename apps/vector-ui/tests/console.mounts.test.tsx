@@ -88,7 +88,7 @@ function mounted(html: string, name: string): number {
 }
 
 test('the directory: the ScopeBar is its filter row, with the path box first, and nothing else between the title and the list', () => {
-	const pager = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1')));
+	const pager = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_page1')));
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
 	const at = mounted(html, 'ScopeBar');
 	const bar = html.slice(at, html.indexOf('</div>', at));
@@ -98,7 +98,7 @@ test('the directory: the ScopeBar is its filter row, with the path box first, an
 });
 
 test('the stats strip ends with a collapsed Charts disclosure holding the StatsCharts', () => {
-	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('list_documents_page1')).items;
 	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
 	const html = renderToStaticMarkup(<StatsStrip stats={stats} dialect={dialect} readOnly={false} documents={rows} />);
 	assert.match(html, /<details[^>]*><summary[^>]*>Charts<\/summary>/);
@@ -123,7 +123,7 @@ test('while a scope is active the stats strip says what it covers on a second li
 });
 
 test('the charts: four figures, each a labelled picture over real buttons for the bars the store can be asked for, and a table of every bin', () => {
-	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items, ...readDocumentsPage(fixture('documents_page2_last')).items];
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('list_documents_page1')).items, ...readDocumentsPage(fixture('list_documents_page2_last')).items];
 	const html = renderToStaticMarkup(<StatsCharts rows={rows} total={42} dialect={dialect} onScope={noop} />);
 	assert.doesNotMatch(html, /Not built yet/);
 	for (const id of ['chunks', 'length', 'types', 'ingest']) assert.match(html, new RegExp(`data-chart="${id}"`), id);
@@ -140,7 +140,7 @@ test('the charts: four figures, each a labelled picture over real buttons for th
 });
 
 test('the charts mark the bar the scope selected (pressed, outlined) and say what they cannot draw', () => {
-	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('list_documents_page1')).items;
 	const html = renderToStaticMarkup(<StatsCharts rows={rows} dialect={dialect} onScope={noop} scope={{ file_types: ['md'] }} />);
 	assert.match(html, /aria-label="md: 2 documents\. Scope the documents to these" aria-pressed="true"/);
 	assert.equal((html.match(/data-selected=""/g) ?? []).length, 1);
@@ -163,7 +163,7 @@ function elementsOf(node: React.ReactNode, out: React.ReactElement[] = []): Reac
 }
 
 test("the strip's one-second clock re-renders only the 'counts as of' words, never the charts", () => {
-	const rows: IDocumentItem[] = readDocumentsPage(fixture('documents_page1')).items;
+	const rows: IDocumentItem[] = readDocumentsPage(fixture('list_documents_page1')).items;
 	const stats = { view: readStats(fixture('stats_pgvector')), status: 'ready' as const, error: null, lastAt: 0, mode: 'full' as const };
 	const onScope = (): void => undefined;
 	const props = { stats, dialect, readOnly: false, documents: rows, onScope };
@@ -184,7 +184,7 @@ test("the strip's one-second clock re-renders only the 'counts as of' words, nev
 });
 
 test('the ingest chart with one far-off ingest time: a few dozen bars, not ninety thousand', () => {
-	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items, { ...(readDocumentsPage(fixture('documents_page1')).items[0] as IDocumentItem), objectId: 'sentinel', ingestedAt: '9999-12-31T23:59:59Z' }];
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('list_documents_page1')).items, { ...(readDocumentsPage(fixture('list_documents_page1')).items[0] as IDocumentItem), objectId: 'sentinel', ingestedAt: '9999-12-31T23:59:59Z' }];
 	const started = performance.now();
 	const html = renderToStaticMarkup(<StatsCharts rows={rows} total={null} dialect={dialect} onScope={noop} />);
 	const took = performance.now() - started;
@@ -227,14 +227,14 @@ test('a document tab holds its HealthPanel', () => {
 });
 
 test('the health panel: checking, the problems with their numbers, what this store does not report, and the on-demand count', () => {
-	const legacy = readDocumentsPage(fixture('documents_filter_partial')).items[0] as IDocumentItem;
+	const legacy = readDocumentsPage(fixture('list_documents_filter_partial')).items[0] as IDocumentItem;
 	assert.match(renderToStaticMarkup(<HealthPanel item={null} />), /role="status"[^>]*>Checking this document…</);
 	const html = renderToStaticMarkup(<HealthPanel item={{ ...legacy, has_first_chunk: false, chunks: 30 }} listing="active" medianChunks={6} />);
 	assert.doesNotMatch(html, /Not built yet/);
 	assert.match(html, /<li [^>]*data-flag="no_first_chunk"><span[^>]*>no first chunk<\/span><span>Chunk 0 is not stored: the document was partly removed or partly ingested\.<\/span><\/li>/);
 	assert.match(html, /data-flag="deleted_chunks"><span[^>]*>1 deleted chunk<\/span><span>1 soft-deleted chunk of this document is still stored\.<\/span>/);
 	assert.doesNotMatch(html, /data-flag="gaps"/, 'the missing ids are chunk 0 and the deleted one');
-	const qdrant = readDocumentsPage(fixture('documents_filter_client')).items[0] as IDocumentItem;
+	const qdrant = readDocumentsPage(fixture('list_documents_filter_client')).items[0] as IDocumentItem;
 	const unreported = renderToStaticMarkup(<HealthPanel item={qdrant} medianChunks={10} />);
 	assert.match(unreported, /No problem found in what this store reports\./);
 	assert.match(unreported, /role="note"[^>]*>This store does not report chunk ids or soft-deleted chunks per document, so gaps and deleted chunks are not checked; pgvector stores report them\.</);
@@ -249,7 +249,7 @@ test('the health panel: checking, the problems with their numbers, what this sto
 });
 
 test('the directory lists flagged documents under "Needs attention" with their badges; the strip says how many', () => {
-	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('documents_page1')).items.map((r) => ({ ...r, max_chunk_id: (r.chunks ?? 1) - 1, deleted_chunks: 0 })), { ...(readDocumentsPage(fixture('documents_filter_partial')).items[0] as IDocumentItem), objectId: 'legacy-falcon' }];
+	const rows: IDocumentItem[] = [...readDocumentsPage(fixture('list_documents_page1')).items.map((r) => ({ ...r, max_chunk_id: (r.chunks ?? 1) - 1, deleted_chunks: 0 })), { ...(readDocumentsPage(fixture('list_documents_filter_partial')).items[0] as IDocumentItem), objectId: 'legacy-falcon' }];
 	const pager = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage({ success: true, items: rows, next_cursor: null, total: rows.length, counts_exact: true, distinct: true, sorted: true, caveats: [] }));
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} />);
 	assert.match(html, /aria-label="Folder Needs attention \(1\)"/);
@@ -290,7 +290,7 @@ test("a scope's listing before the store answers: the status line says it is loa
 });
 
 test("the directory's export with the Documents toggle off: 'Documents in scope' holds only the scope's documents, its count in the label", () => {
-	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_page1'))), readDocumentsPage(fixture('documents_page2_last')));
+	const pager = pagerApplyPage(pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_page1'))), readDocumentsPage(fixture('list_documents_page2_last')));
 	const prefix = 'C:/demo/greenhouse/';
 	const html = renderToStaticMarkup(<DocumentDirectory pager={pager} selectedId={null} writes={on} onSelect={noop} onRemove={noop} onLoadMore={noop} onRetry={noop} scope={scopeOf({ path_prefix: prefix }, false)} onScope={noop} />);
 	assert.match(html, /role="status">Not applied to this list\. Scope: 2 of 7 loaded match \(filtered here\)<\/div>/);

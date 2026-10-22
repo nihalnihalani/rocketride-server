@@ -44,7 +44,7 @@ test('paths: forward and back slashes, drive letters, network shares, POSIX root
 });
 
 test('groups: one per folder, then Uploaded, then Needs attention; duplicate paths kept with a short objectId', () => {
-	const items = readDocumentsPage(fixture('documents_windows_and_posix_paths')).items;
+	const items = readDocumentsPage(fixture('list_documents_windows_and_posix_paths')).items;
 	items.push(doc('orphan-1', 'ops/old_memo.txt', { has_first_chunk: false }));
 	const state = pagerApplyPage(pagerBegin(pagerInit()), page(items, { nextCursor: null, total: items.length }));
 	const groups = buildGroups(state.rows);
@@ -104,7 +104,7 @@ test('"oversize" is a badge in its folder, never a reason to leave it: a folder 
 });
 
 test('the filter is client-side over what is loaded, case-insensitive, and says how much is loaded while loading', () => {
-	const items = readDocumentsPage(fixture('documents_page1')).items;
+	const items = readDocumentsPage(fixture('list_documents_page1')).items;
 	assert.deepEqual(
 		filterItems(items, 'ORCHID').map((i) => i.path),
 		['C:/demo/greenhouse/orchid_notes.pdf', 'C:/demo/greenhouse/orchid_notes.txt']
@@ -132,12 +132,12 @@ test('auto-pager: keeps asking for pages in the background until the store has n
 	assert.equal(pagerWantsPage(state), false);
 	state = pagerBegin(state);
 	assert.equal(pagerWantsPage(state), true);
-	state = pagerApplyPage(state, readDocumentsPage(fixture('documents_page1')));
+	state = pagerApplyPage(state, readDocumentsPage(fixture('list_documents_page1')));
 	assert.equal(state.status, 'loading');
 	assert.equal(pagerWantsPage(state), true);
-	assert.equal(state.cursor, readDocumentsPage(fixture('documents_page1')).nextCursor);
+	assert.equal(state.cursor, readDocumentsPage(fixture('list_documents_page1')).nextCursor);
 	assert.equal(pagerProgressText(state), 'Loading documents… 5 of 7');
-	state = pagerApplyPage(state, readDocumentsPage(fixture('documents_page2_last')));
+	state = pagerApplyPage(state, readDocumentsPage(fixture('list_documents_page2_last')));
 	assert.equal(state.status, 'done');
 	assert.equal(pagerWantsPage(state), false);
 	assert.equal(state.rows.length, 7);
@@ -254,11 +254,11 @@ test('auto-pager: a repeated page ends the listing instead of asking for it agai
 });
 
 test('a store that cannot page ends the listing with its caveat; one that lists in storage order is sorted here', () => {
-	const stuck = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_paging_unsupported')));
+	const stuck = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_paging_unsupported')));
 	assert.equal(stuck.status, 'unsupported');
 	assert.equal(pagerWantsPage(stuck), false);
 	assert.deepEqual(pagerFooter(stuck), { text: 'Limit reached at 5 documents; more may exist', loadMore: false, caveat: CAVEAT_SENTENCES.documents_paging_unsupported, retry: false });
-	const unsorted = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('documents_unsorted')));
+	const unsorted = pagerApplyPage(pagerBegin(pagerInit()), readDocumentsPage(fixture('list_documents_unsorted')));
 	assert.equal(unsorted.status, 'done');
 	assert.deepEqual(pagerFooter(unsorted), { text: 'sorted here; this store lists documents in storage order', loadMore: false, caveat: null, retry: false });
 	assert.deepEqual(
@@ -270,7 +270,7 @@ test('a store that cannot page ends the listing with its caveat; one that lists 
 test("the directory's export: the documents columns, each row the directory's own words and numbers, nothing else the store sent", () => {
 	const { documentExportRows } = require('../src/vector/documents') as typeof import('../src/vector/documents');
 	const { EXPORT_COLUMNS } = require('../src/contract/types') as typeof import('../src/contract/types');
-	const items = readDocumentsPage(fixture('documents_filter_server')).items;
+	const items = readDocumentsPage(fixture('list_documents_filter_server')).items;
 	const out = documentExportRows([{ ...items[0], embedding: [0.1, 0.2], token: 'secret' } as unknown as IDocumentItem, items[1] as IDocumentItem]);
 	assert.deepEqual(out.columns, EXPORT_COLUMNS.documents);
 	assert.equal(out.rows.length, 2);

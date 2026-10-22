@@ -90,12 +90,12 @@ test(`oversize: more than ${OVERSIZE_FACTOR}× the median chunks of the loaded d
 });
 
 test('a store that does not report chunk ids or deleted chunks (null or absent): those flags are not computed, and the panel says which stores report them', () => {
-	const qdrant = readDocumentsPage(fixture('documents_filter_client')).items[0] as IDocumentItem;
+	const qdrant = readDocumentsPage(fixture('list_documents_filter_client')).items[0] as IDocumentItem;
 	assert.equal(qdrant.max_chunk_id, null);
 	const health = documentHealth(qdrant, { medianChunks: 10 });
 	assert.deepEqual(health.flags, []);
 	assert.deepEqual(health.unchecked, ['gaps', 'deleted_chunks']);
-	const old = readDocumentsPage(fixture('documents_page1')).items[0] as IDocumentItem;
+	const old = readDocumentsPage(fixture('list_documents_page1')).items[0] as IDocumentItem;
 	assert.equal('max_chunk_id' in old, false, 'an older node sends no key at all');
 	assert.deepEqual(documentHealth(old, { medianChunks: 10 }).unchecked, ['gaps', 'deleted_chunks']);
 	assert.equal(HEALTH_NOT_REPORTED, 'This store does not report chunk ids or soft-deleted chunks per document, so gaps and deleted chunks are not checked; pgvector stores report them.');
@@ -103,7 +103,7 @@ test('a store that does not report chunk ids or deleted chunks (null or absent):
 });
 
 test('the legacy table: the chunk-0-less document and the one with a soft-deleted row, under the active listing', () => {
-	const legacy = readDocumentsPage(fixture('documents_filter_partial')).items[0] as IDocumentItem;
+	const legacy = readDocumentsPage(fixture('list_documents_filter_partial')).items[0] as IDocumentItem;
 	assert.deepEqual(kinds(legacy), ['deleted_chunks'], 'falcon handbook: 31 active chunks up to id 30, 1 soft-deleted');
 	assert.deepEqual(kinds({ ...legacy, has_first_chunk: false, chunks: 30 }), ['no_first_chunk', 'deleted_chunks']);
 });

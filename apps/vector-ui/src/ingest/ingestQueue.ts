@@ -87,7 +87,7 @@ export interface IngestDeps {
 	/** Whether the chunk count can be read after an upload. */
 	canCount: boolean;
 	/** Call a tool on the store node (never throws). */
-	callTool(tool: 'chunks' | 'documents', input: Record<string, unknown>): Promise<CallOutcome>;
+	callTool(tool: 'chunks' | 'list_documents', input: Record<string, unknown>): Promise<CallOutcome>;
 	/** The ingest role's sendFiles. */
 	sendFiles(files: ISendFile[], options: { maxConcurrent: number }): Promise<Array<Record<string, unknown>>>;
 	/** Uploads completed (stored or not): refresh stats and the directory. */
@@ -274,7 +274,7 @@ export function createIngestQueue(deps: IngestDeps): IngestQueue {
 				let failure: string | null = null;
 				for (let attempt = 0; attempt <= RECOUNT_DELAYS_MS.length && !listed && failure === null; attempt++) {
 					if (attempt > 0) await sleep(RECOUNT_DELAYS_MS[attempt - 1] as number);
-					const outcome = await deps.callTool('documents', { object_ids: [objectId], limit: 1 });
+					const outcome = await deps.callTool('list_documents', { object_ids: [objectId], limit: 1 });
 					if (disposed) return;
 					if (!outcome.ok) {
 						failure = outcome.message;

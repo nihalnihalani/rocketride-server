@@ -8,6 +8,7 @@
 	"documents_without_first_chunk": null,
 	"chunks": null,
 	"deleted_chunks": null,
+	"deleted_documents": null,
 	"raw_count": null,
 	"tables": null,
 	"avg_chunks_per_document": null,

@@ -65,7 +65,7 @@
 // hand in any group, reviewed or not, is never queued by another; a policy's
 // keep protects its document when its group queues something. Removal itself
 // is the console's: the panel hands the queued objectIds to `requestRemove`,
-// which confirms with the typed count and sends `remove_document` in batches.
+// which confirms with the typed count and sends `delete` in batches.
 //
 // The reviewed documents of a connection live in the registry's 'reviewed
 // documents' cache (adapters/connections.ts), cleared on a change of

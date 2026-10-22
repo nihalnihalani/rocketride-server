@@ -13,10 +13,10 @@ import { ExplorerToolError, VECTOR_ROLES, checkObject } from 'shared/explorer';
 import { codedError, fakeWorld, manualClock, projectRows, ragComponents, vectorComponents } from 'shared/explorer/connect/testing';
 import type { IFakeWorld, IToolCall } from 'shared/explorer/connect/testing';
 import { DOC_SCHEMES, TOOL, VECTOR_PROVIDERS, VECTOR_TOOLS, WRITE_TOOLS, makeVectorEndpointStore, vectorNodeFilter, vectorProbe } from '../src/adapters/explorer';
-import { callVector, chunkCount, embedTexts, fetchChunks, fetchDocumentsPage, fetchStats, removeDocumentsBatch, vectorChannels } from '../src/adapters/actions';
+import { callVector, chunkCount, deleteBatch, embedTexts, fetchChunks, fetchDocumentsPage, fetchStats, restoreBatch, trashBatch, vectorChannels } from '../src/adapters/actions';
 import { fixture } from './support/fixtures';
 
-/** A world whose store answers like a pgvector node: dialect, stats, documents, chunks, remove. */
+/** A world whose store answers like a pgvector node: dialect, stats, list_documents, chunks and the writes. */
 function world(rows = projectRows(['ingest_1', 'chat_1', 'tools_1'], vectorComponents('postgres')), over: Partial<Record<string, (call: IToolCall) => unknown>> = {}): IFakeWorld {
 	return fakeWorld(rows, (call) => {
 		const custom = over[call.tool];
@@ -26,12 +26,16 @@ function world(rows = projectRows(['ingest_1', 'chat_1', 'tools_1'], vectorCompo
 				return fixture('dialect_pgvector');
 			case 'stats':
 				return call.input?.mode === 'quick' ? fixture('stats_quick') : fixture('stats_pgvector');
-			case 'documents':
-				return call.input?.cursor ? fixture('documents_page2_last') : fixture('documents_page1');
+			case 'list_documents':
+				return call.input?.cursor ? fixture('list_documents_page2_last') : fixture('list_documents_page1');
 			case 'chunks':
 				return fixture('chunks_page');
-			case 'remove_document':
-				return fixture('remove_document_ok');
+			case 'delete':
+				return call.input?.deleted_only ? fixture('delete_deleted_only') : fixture('delete_ok');
+			case 'soft_delete':
+				return fixture('soft_delete_ok');
+			case 'restore':
+				return fixture('restore_ok');
 			case 'embed':
 				return fixture('embed_ok');
 			default:
@@ -56,9 +60,13 @@ test('the tool table: reads idempotent and capability-gated, writes never replay
 		assert.equal(spec.check, checkObject, `${tool}: a failure envelope passes the session and keeps its code`);
 		assert.equal(spec.idempotent, !WRITE_TOOLS.has(tool), `${tool}: idempotent iff a read`);
 	}
-	assert.deepEqual([...WRITE_TOOLS].sort(), ['delete', 'remove_document', 'upsert']);
-	assert.equal(VECTOR_TOOLS[TOOL.removeDocument].capability, 'remove');
-	assert.equal(VECTOR_TOOLS[TOOL.documents].capability, 'documents');
+	assert.deepEqual([...WRITE_TOOLS].sort(), ['delete', 'restore', 'soft_delete', 'upsert']);
+	assert.equal(VECTOR_TOOLS[TOOL.softDelete].capability, 'soft_delete', 'the trash needs the driver to mark chunks deleted');
+	assert.equal(VECTOR_TOOLS[TOOL.restore].capability, 'soft_delete');
+	assert.equal(VECTOR_TOOLS[TOOL.delete].capability, undefined, 'delete is the legacy write every node answers');
+	assert.equal(VECTOR_TOOLS[TOOL.listDocuments].capability, 'documents');
+	assert.equal(TOOL.listDocuments, 'list_documents');
+	assert.ok(!Object.keys(VECTOR_TOOLS).includes('documents') && !Object.keys(VECTOR_TOOLS).includes('remove_document'), 'the old names are gone');
 	assert.equal(VECTOR_TOOLS[TOOL.sample].capability, 'sample');
 	assert.equal(VECTOR_TOOLS[TOOL.stats].capability, undefined, 'stats is the legacy tool every node answers');
 	assert.equal(VECTOR_TOOLS[TOOL.dialect].timeoutMs, 15_000);
@@ -137,8 +145,8 @@ test('the typed calls: stats in full or quick mode, document pages, chunks, all 
 	assert.deepEqual(sent, [
 		['stats', 'store_1', { mode: 'full' }],
 		['stats', 'store_1', { mode: 'quick' }],
-		['documents', 'store_1', { cursor: null, limit: 500, deleted: 'active', sort: 'path' }],
-		['documents', 'store_1', { cursor: page.nextCursor, limit: 500, deleted: 'active', sort: 'path' }],
+		['list_documents', 'store_1', { cursor: null, limit: 500, deleted: 'active', sort: 'path' }],
+		['list_documents', 'store_1', { cursor: page.nextCursor, limit: 500, deleted: 'active', sort: 'path' }],
 		['chunks', 'store_1', { object_id: 'kestrel', after_chunk: -1, limit: 100, deleted: 'active' }],
 	]);
 });
@@ -174,26 +182,58 @@ test('a failure envelope rejects with its code; the existence probe reads NOT_FO
 	);
 });
 
-test('remove_document is sent once, even when the task is restarting, and reports what the node removed', async () => {
-	let attempts = 0;
-	const w = world(undefined, {
-		remove_document: () => {
-			attempts += 1;
-			throw codedError('Task is not running', 'TASK_STOPPED');
-		},
-	});
-	const { store } = await ready(w);
-	const endpoint = store.getState().endpoints[0];
-	await assert.rejects(removeDocumentsBatch(store.session(w.client, endpoint), endpoint.nodeId, ['a']), (error: ExplorerToolError) => error.code === 'TASK_STOPPED');
-	assert.equal(attempts, 1, 'a write is never replayed');
+test('every write (delete, soft_delete, restore) is sent once, even when the task is restarting, and reports what the node did', async () => {
+	const writes = [
+		['delete', deleteBatch],
+		['soft_delete', trashBatch],
+		['restore', restoreBatch],
+	] as const;
+	for (const [tool, call] of writes) {
+		let attempts = 0;
+		const w = world(undefined, {
+			[tool]: () => {
+				attempts += 1;
+				throw codedError('Task is not running', 'TASK_STOPPED');
+			},
+		});
+		const { store } = await ready(w);
+		const endpoint = store.getState().endpoints[0];
+		await assert.rejects(call(store.session(w.client, endpoint), endpoint.nodeId, ['a']), (error: ExplorerToolError) => error.code === 'TASK_STOPPED');
+		assert.equal(attempts, 1, `${tool}: a write is never replayed`);
+	}
+	const kestrel = '91ae15d4-3f6e-589f-bb81-72301f2ca1b6';
+	const partly = '2c4e8a10-7b1d-5f3a-9e6c-0d8b4a2f1e57';
 	const ok = world();
 	const { store: s2 } = await ready(ok);
 	const e2 = s2.getState().endpoints[0];
-	const view = await removeDocumentsBatch(s2.session(ok.client, e2), e2.nodeId, ['kestrel']);
-	assert.equal(view.removedChunks, 12);
+	const session = s2.session(ok.client, e2);
+	const deleted = await deleteBatch(session, e2.nodeId, [kestrel]);
+	assert.deepEqual([deleted.removed, deleted.removedChunks, deleted.keptLive], [[{ objectId: kestrel, chunks: null }], 12, []]);
+	const emptied = await deleteBatch(session, e2.nodeId, [kestrel, partly], { deletedOnly: true });
+	assert.deepEqual([emptied.removed.map((r) => r.objectId), emptied.keptLive], [[kestrel], [partly]], 'a document with a live chunk is kept');
+	assert.deepEqual((await trashBatch(session, e2.nodeId, [kestrel])).moved, [kestrel]);
+	assert.deepEqual((await restoreBatch(session, e2.nodeId, [kestrel])).matchedChunks, 12);
 	assert.deepEqual(
-		ok.calls.filter((c) => c.tool === 'remove_document').map((c) => [c.nodeId, c.input]),
-		[['store_1', { object_ids: ['kestrel'] }]]
+		ok.calls.filter((c) => ['delete', 'soft_delete', 'restore'].includes(c.tool)).map((c) => [c.tool, c.nodeId, c.input]),
+		[
+			['delete', 'store_1', { object_ids: [kestrel] }],
+			['delete', 'store_1', { object_ids: [kestrel, partly], deleted_only: true }],
+			['soft_delete', 'store_1', { object_ids: [kestrel] }],
+			['restore', 'store_1', { object_ids: [kestrel] }],
+		]
+	);
+});
+
+test('the directory lists through list_documents: the active documents, or the trash', async () => {
+	const w = world();
+	const { store } = await ready(w);
+	const endpoint = store.getState().endpoints[0];
+	const session = store.session(w.client, endpoint);
+	await fetchDocumentsPage(session, endpoint.nodeId, { cursor: null, limit: 500 });
+	await fetchDocumentsPage(session, endpoint.nodeId, { cursor: null, limit: 500 }, {}, null, 'deleted');
+	assert.deepEqual(
+		w.calls.filter((c) => c.tool === 'list_documents').map((c) => c.input?.deleted),
+		['active', 'deleted']
 	);
 });
 

@@ -24,9 +24,10 @@
 	"allow_writes": true,
 	"writes_scope": "tools_source",
 	"write_tools": [
-		"remove_document",
+		"upsert",
 		"delete",
-		"upsert"
+		"soft_delete",
+		"restore"
 	],
 	"capabilities": {
 		"describe": true,
@@ -47,7 +48,7 @@
 		"search_keyword": true,
 		"remove": true,
 		"remove_count": true,
-		"soft_delete": false,
+		"soft_delete": true,
 		"clusters": false,
 		"documents_filter": false,
 		"recommend_best_score": false,
