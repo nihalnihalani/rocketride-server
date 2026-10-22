@@ -41,7 +41,7 @@ no node id the call goes to the first node in the pipeline that owns a tool of
 that name. The functions are offered only while Expose as tools is on, which
 is off by default because the table lives in a managed database and `objdir`
 and `get` together return all of it. The write functions (`upsert`, `delete`,
-and the Vector Explorer's `remove_document`) are offered only while Allow
+`soft_delete` and `restore`) are offered only while Allow
 writes through tools is also on, because they change that table. While a
 switch is off the affected functions are left out of the tool list: an agent's
 call fails with "not found in tool catalog", an app's `client.tool` call fails
@@ -58,9 +58,12 @@ wired to this node's tools.
 | `stats` | Reports the number of stored rows, the embedding model and the vector size. |
 | `upsert` | Adds or replaces a non-empty `documents` array; each needs `content` and an `object_id`. Offered only while writes are allowed. |
 | `delete` | Removes every chunk of the documents in a non-empty `object_ids` array. Offered only while writes are allowed. |
+| `list_documents` | Lists the documents one by one with their path and chunk count, in pages ordered by path; pass `next_cursor` for the next page. `deleted: 'deleted'` (or `true`) lists the trash, and `parent` keeps one exact path. |
+| `soft_delete` | Moves the documents of a non-empty `object_ids` array to the trash: their chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. Returns `matched_chunks`. Offered only while writes are allowed. |
+| `restore` | Takes the documents of a non-empty `object_ids` array out of the trash. Offered only while writes are allowed. |
 
 The Vector Explorer reads the store through the same tool surface (`dialect`,
-`documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors` and the
+`list_documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors` and the
 other functions of the vector tool contract), so it too needs Expose as tools.
 
 Past those two switches, every write still passes the store's write gate. An
@@ -151,7 +154,7 @@ not restricted to the matches above the questions lane's score threshold;
 ### Allow writes through tools
 
 Off by default, and read only while Expose as tools is on. When off, `upsert`,
-`delete` and `remove_document` are not offered: an agent's call fails with
+`delete`, `soft_delete` and `restore` are not offered: an agent's call fails with
 "not found in tool catalog", an app's with the engine's "No handler found for
 tool" error.
 `search`, `objdir`, `get`, and `stats` keep working, and the documents lane
@@ -242,10 +245,10 @@ pooler. Errors never name the database server, user or database.
 
 | Field | Type | Description | Default |
 |---|---|---|---|
-| `rrvector.allow_write` | `boolean` | **Allow writes through tools**<br/>Permit the upsert, delete and remove_document tool functions (remove_document is the Vector Explorer's trash can) to change this table in your RocketRide cloud database. Applies only while Expose as tools is on; a call from a Tools source also needs Allow document management from tool calls. Leave OFF unless a trusted application or agent needs to manage documents through tools; the documents lane and the read tools (search, objdir, get, stats and the Vector Explorer's) are unaffected. | `false` |
-| `rrvector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Lets a Tools source of this pipeline add and remove documents through tool calls (the Vector Explorer's trash can, and the upsert, delete and remove_document tools). Off by default, and read only while Expose as tools and Allow writes through tools are on. The table is shared by every pipeline that names it in the same database. | `false` |
+| `rrvector.allow_write` | `boolean` | **Allow writes through tools**<br/>Permit the upsert, delete, soft_delete and restore tool functions (soft_delete and restore move documents into and out of the trash; delete removes them for good) to change this table in your RocketRide cloud database. Applies only while Expose as tools is on; a call from a Tools source also needs Allow document management from tool calls. Leave OFF unless a trusted application or agent needs to manage documents through tools; the documents lane and the read tools (search, objdir, get, stats, list_documents and the Vector Explorer's) are unaffected. | `false` |
+| `rrvector.allow_writes` | `boolean` | **Allow document management from tool calls**<br/>Lets a Tools source of this pipeline add, trash, restore and remove documents through tool calls (the Vector Explorer, and the upsert, soft_delete, restore and delete tools). Off by default, and read only while Expose as tools and Allow writes through tools are on. The table is shared by every pipeline that names it in the same database. | `false` |
 | `rrvector.collection` | `string` | **Table**<br/>Name of the table to store vectors in your RocketRide cloud database. | `"rocketride"` |
-| `rrvector.expose_tools` | `boolean` | **Expose as tools**<br/>Offer this table to agents and apps as tool functions: search, objdir, get and stats (and the Vector Explorer's read tools), plus upsert, delete and remove_document when writes through tools are allowed. Leave OFF unless a trusted application or agent in this pipeline is meant to read the table through tools; objdir and get together return the whole table, not only the matches the questions lane returns. The documents and questions lanes are unaffected. | `false` |
+| `rrvector.expose_tools` | `boolean` | **Expose as tools**<br/>Offer this table to agents and apps as tool functions: search, objdir, get, stats and list_documents (and the Vector Explorer's read tools), plus upsert, delete, soft_delete and restore when writes through tools are allowed. Leave OFF unless a trusted application or agent in this pipeline is meant to read the table through tools; objdir and get together return the whole table, not only the matches the questions lane returns. The documents and questions lanes are unaffected. | `false` |
 | `rrvector.hnsw_ef_construction` | `integer` | **HNSW ef_construction**<br/>HNSW build-time candidate list size used when the index is first created. | `64` |
 | `rrvector.hnsw_m` | `integer` | **HNSW m**<br/>HNSW graph degree (max connections per layer) used when the index is first created. | `16` |
 | `rrvector.profile` | `string` | **RocketRide cloud database**<br/>Connect to... | `"cloud"` |

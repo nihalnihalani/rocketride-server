@@ -783,16 +783,21 @@ class Store(DocumentStoreBase):
         self.client.delete(collection_name=self.collection, points_selector=filter_objectId, wait=True)
         return
 
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the chunks moved to the trash, counted before the update (None when the
+        count fails to answer).
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
-            return
+        if not objectIds or not self.doesCollectionExist():
+            return 0
+
+        # The chunks this call moves: the ones not in the trash yet
+        moving = self.vxChunksInState(objectIds, deleted=False)
 
         # Build a filter for an object id
         filter_objectId = Filter(must=[FieldCondition(key='meta.objectId', match=models.MatchAny(any=objectIds))])
@@ -802,18 +807,22 @@ class Store(DocumentStoreBase):
         self.client.set_payload(
             collection_name=self.collection, payload={'isDeleted': True}, key='meta', points=filter_objectId
         )
-        return
+        return moving
 
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now "comes back" after begin deleted
+        This occurs if a document now "comes back" after begin deleted.
+        Returns the chunks taken out of the trash, counted before the update.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self.doesCollectionExist():
-            return
+        if not objectIds or not self.doesCollectionExist():
+            return 0
+
+        # The chunks this call moves: the ones in the trash
+        moving = self.vxChunksInState(objectIds, deleted=True)
 
         # Build a filter for an object id
         filter_objectId = Filter(must=[FieldCondition(key='meta.objectId', match=models.MatchAny(any=objectIds))])
@@ -822,7 +831,7 @@ class Store(DocumentStoreBase):
         self.client.set_payload(
             collection_name=self.collection, payload={'isDeleted': False}, key='meta', points=filter_objectId
         )
-        return
+        return moving
 
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:
         """

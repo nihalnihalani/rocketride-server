@@ -316,7 +316,7 @@ def test_documents_tool_lists_the_orphan_unsorted(collection):
     store, expect = collection
     node = VectorStoreToolMixin()
     node.IGlobal = types.SimpleNamespace(store=store)
-    answer = node.documents({'limit': 500, 'deleted': 'active'})
+    answer = node.list_documents({'limit': 500, 'deleted': 'active'})
     assert answer['success'] is True and answer['sorted'] is False
     orphans = {i['objectId'] for i in answer['items'] if not i['has_first_chunk']}
     assert orphans == expect.orphans
@@ -419,17 +419,17 @@ def test_documents_tool_answers_partial_and_none_on_chroma(new_store):
     from .test_vectordb_tool_mixin import node
 
     store, expect = new_store
-    answer = node(store, logical_type='chroma').documents(
+    answer = node(store, logical_type='chroma').list_documents(
         {'filter': {'has_first_chunk': False, 'path_contains': 'doc'}}
     )
     assert answer['success'] is True
     assert (answer['filter_applied'], answer['filter_ignored']) == ('partial', ['path_contains'])
     assert 'documents_filter_partial' in answer['caveats']
     assert {item['objectId'] for item in answer['items']} == expect.orphans
-    answer = node(store, logical_type='chroma').documents({'filter': {'path_prefix': 'nowhere/'}})
+    answer = node(store, logical_type='chroma').list_documents({'filter': {'path_prefix': 'nowhere/'}})
     assert (answer['filter_applied'], answer['filter_ignored']) == ('none', ['path_prefix'])
     assert 'documents_filter_client' in answer['caveats']
-    answer = node(store, logical_type='chroma').documents({'filter': {'has_first_chunk': True}})
+    answer = node(store, logical_type='chroma').list_documents({'filter': {'has_first_chunk': True}})
     assert (answer['filter_applied'], answer['filter_ignored']) == ('server', [])
     assert expect.orphans.isdisjoint(item['objectId'] for item in answer['items'])
     # A 'server' answer carries the count the app shows ("N documents match").

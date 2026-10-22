@@ -213,6 +213,12 @@ def _is_count(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _modified_count(result: Any) -> Optional[int]:
+    """The documents an ``update_many`` changed (pymongo's ``modified_count``); None when it did not say."""
+    value = getattr(result, 'modified_count', None)
+    return value if _is_count(value) else None
+
+
 def _encode_cursor(offset: int, first: Optional[str]) -> str:
     """Opaque listing cursor: the next offset and the first objectId of the page just served."""
     raw = json.dumps({'o': offset, 'f': first}, separators=(',', ':')).encode('utf-8')
@@ -625,24 +631,26 @@ class Store(DocumentStoreBase):
         self.collection.delete_many({'meta.objectId': {'$in': objectIds}})
 
     @_backend_errors('markDeleted')
-    def markDeleted(self, objectIds: List[str]) -> None:
-        """Mark documents as deleted."""
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
+        """Mark documents as deleted; return the chunks moved to the trash (MongoDB's modified count)."""
         if not objectIds:
-            return
+            return 0
         if not self.doesCollectionExist():
-            return
+            return 0
 
-        self.collection.update_many({'meta.objectId': {'$in': objectIds}}, {'$set': {'meta.isDeleted': True}})
+        result = self.collection.update_many({'meta.objectId': {'$in': objectIds}}, {'$set': {'meta.isDeleted': True}})
+        return _modified_count(result)
 
     @_backend_errors('markActive')
-    def markActive(self, objectIds: List[str]) -> None:
-        """Mark documents as active (not deleted)."""
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
+        """Mark documents as active (not deleted); return the chunks taken out of the trash."""
         if not objectIds:
-            return
+            return 0
         if not self.doesCollectionExist():
-            return
+            return 0
 
-        self.collection.update_many({'meta.objectId': {'$in': objectIds}}, {'$set': {'meta.isDeleted': False}})
+        result = self.collection.update_many({'meta.objectId': {'$in': objectIds}}, {'$set': {'meta.isDeleted': False}})
+        return _modified_count(result)
 
     @_backend_errors('render')
     def render(self, objectId: str, callback: Callable[[str], None]) -> None:

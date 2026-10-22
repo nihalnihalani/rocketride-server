@@ -214,6 +214,19 @@ def test_empty_id_lists_answer_nothing_without_asking_the_server():
 # --- counts ---------------------------------------------------------------------------
 
 
+def test_mark_deleted_and_active_return_the_chunks_they_moved():
+    """The trash writes answer the chunks they moved into or out of the trash (soft_delete's matched_chunks)."""
+    store = make_store(drv)
+    _corpus(store, docs=3, chunks=4)
+    assert store.markDeleted(['doc-1', 'ghost']) == 4
+    assert store.markDeleted(['doc-1']) == 0, 'already in the trash: nothing moves'
+    assert store.countChunks(vx_filter(deleted='deleted')) == 4
+    assert store.markActive(['doc-1', 'doc-2']) == 4, 'doc-2 was never in the trash'
+    assert store.markActive(['doc-1']) == 0
+    assert store.markDeleted([]) == 0 and store.markActive([]) == 0
+    assert store.countChunks(vx_filter()) == 12
+
+
 def test_count_chunks_excludes_the_control_record_and_follows_the_filter():
     store = make_store(drv)
     _corpus(store, docs=3, chunks=4)

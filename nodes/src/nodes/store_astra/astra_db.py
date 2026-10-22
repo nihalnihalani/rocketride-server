@@ -739,16 +739,21 @@ class Store(DocumentStoreBase):
         return
 
     @_backend_errors('markDeleted')
-    def markDeleted(self, objectIds: List[str]) -> None:
+    def markDeleted(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as deleted.
 
-        They then will not be returned from the search without specifying deleted=True
+        They then will not be returned from the search without specifying deleted=True.
+        Returns the chunks moved to the trash, counted before the update (None above the
+        count ceiling).
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self._doesCollectionExist():
-            return
+        if not objectIds or not self._doesCollectionExist():
+            return 0
+
+        # The chunks this call moves: the ones not in the trash yet
+        moving = self.vxChunksInState(objectIds, deleted=False)
 
         # Build a filter for an object id
         filter_objectId = {'meta.objectId': {'$in': objectIds}}
@@ -756,19 +761,23 @@ class Store(DocumentStoreBase):
         # Set all the objects with the given objectId to true
         collection = self.database.get_collection(self.collection_name)
         collection.update_many(filter_objectId, {'$set': {'meta.isDeleted': True}})
-        return
+        return moving
 
     @_backend_errors('markActive')
-    def markActive(self, objectIds: List[str]) -> None:
+    def markActive(self, objectIds: List[str]) -> Optional[int]:
         """
         Mark the set of documents with the given objectId as active.
 
-        This occurs if a document now 'comes back' after begin deleted
+        This occurs if a document now 'comes back' after begin deleted.
+        Returns the chunks taken out of the trash, counted before the update.
         """
         # By definition, if the collection does not exists, there
         # is nothing to mark
-        if not self._doesCollectionExist():
-            return
+        if not objectIds or not self._doesCollectionExist():
+            return 0
+
+        # The chunks this call moves: the ones in the trash
+        moving = self.vxChunksInState(objectIds, deleted=True)
 
         # Build a filter for an object id
         filter_objectId = {'meta.objectId': {'$in': objectIds}}
@@ -776,7 +785,7 @@ class Store(DocumentStoreBase):
         # Set all the objects with the given objectId to true
         collection = self.database.get_collection(self.collection_name)
         collection.update_many(filter_objectId, {'$set': {'meta.isDeleted': False}})
-        return
+        return moving
 
     # Since chunks are returned in any order, and a single objectId
     # may contain tens of thousands of chunks, we grave them one

@@ -372,13 +372,17 @@ class FakeCollection:
         return DeleteResult(deleted_count=before - len(self.docs))
 
     def update_many(self, filter: Dict[str, Any], update: Dict[str, Any], **kwargs: Any) -> UpdateResult:
-        matched = 0
+        # As MongoDB counts them: matched_count every document the filter takes,
+        # modified_count only those whose stored values the update changed.
+        matched = modified = 0
         for doc in self.docs:
             if matches(doc, filter):
                 matched += 1
+                before = copy.deepcopy(doc)
                 for key, value in (update.get('$set') or {}).items():
                     set_path(doc, key, value)
-        return UpdateResult(matched_count=matched, modified_count=matched)
+                modified += int(doc != before)
+        return UpdateResult(matched_count=matched, modified_count=modified)
 
     # --- indexes -------------------------------------------------------
 

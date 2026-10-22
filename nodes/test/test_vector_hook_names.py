@@ -140,9 +140,9 @@ def _called(store: BothPairsStore) -> Sequence[str]:
     return [call[0] for call in store.calls]
 
 
-def test_documents_reads_through_the_explorer_s_listing_only():
+def test_list_documents_reads_through_the_explorer_s_listing_only():
     store = clustered(BothPairsStore, docs=3, chunks=2)
-    answer = node(store).documents({})
+    answer = node(store).list_documents({})
     assert answer['success'] is True, answer
     assert [item['objectId'] for item in answer['items']] == ['doc00', 'doc01', 'doc02']
     assert 'listDocumentPage' in _called(store)

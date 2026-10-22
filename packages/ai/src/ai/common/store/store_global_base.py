@@ -78,8 +78,8 @@ class StoreGlobalBase(IGlobalTransform, ABC):
     embed_query = None
     embed_model_name: Optional[str] = None
 
-    # The DAP write switch of the vector store tools (remove_document, delete,
-    # upsert), read by vx_write_gate.check_write once the outer gate above
+    # The DAP write switch of the vector store tools (upsert, delete,
+    # soft_delete, restore), read by vx_write_gate.check_write once the outer gate above
     # (expose_tools, allow_write) lets a write tool run. Resolved in
     # beginGlobal from the node config key ``allow_writes``; it governs
     # external tool calls (DAP) only. Agents have no switch of their own:

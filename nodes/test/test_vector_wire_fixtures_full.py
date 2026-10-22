@@ -80,20 +80,20 @@ def test_opaque_cursors_and_sample_ids_are_scrubbed_but_their_absence_is_kept():
     assert gen.stored({'items': [], 'next_cursor': None})['next_cursor'] is None
 
 
-def test_an_unsorted_documents_page_compares_as_a_set_of_documents():
+def test_an_unsorted_list_documents_page_compares_as_a_set_of_documents():
     a = {'objectId': 'a', 'path': 'C:/demo/a.md', 'chunks': 2}
     b = {'objectId': 'b', 'path': 'C:/demo/b.md', 'chunks': 1}
-    on_disk = {'qdrant/documents.legacy.json': gen.stored({'items': [a, b], 'sorted': False})}
+    on_disk = {'qdrant/list_documents.legacy.json': gen.stored({'items': [a, b], 'sorted': False})}
     # A backend that lists in storage order may return the same page in another order.
-    assert gen.differences({'qdrant/documents.legacy.json': {'items': [b, a], 'sorted': False}}, on_disk) == []
+    assert gen.differences({'qdrant/list_documents.legacy.json': {'items': [b, a], 'sorted': False}}, on_disk) == []
     # Another page, or a sorted listing in another order, is a difference.
     c = dict(b, objectId='c')
-    assert gen.differences({'qdrant/documents.legacy.json': {'items': [c, a], 'sorted': False}}, on_disk) == [
-        'qdrant/documents.legacy.json'
+    assert gen.differences({'qdrant/list_documents.legacy.json': {'items': [c, a], 'sorted': False}}, on_disk) == [
+        'qdrant/list_documents.legacy.json'
     ]
-    sorted_disk = {'pgvector/documents.json': gen.stored({'items': [a, b], 'sorted': True})}
-    assert gen.differences({'pgvector/documents.json': {'items': [b, a], 'sorted': True}}, sorted_disk) == [
-        'pgvector/documents.json'
+    sorted_disk = {'pgvector/list_documents.json': gen.stored({'items': [a, b], 'sorted': True})}
+    assert gen.differences({'pgvector/list_documents.json': {'items': [b, a], 'sorted': True}}, sorted_disk) == [
+        'pgvector/list_documents.json'
     ]
 
 
@@ -129,7 +129,7 @@ def test_similarity_answers_compare_within_a_tolerance_and_the_rest_exactly():
     assert gen.differences({'qdrant/sample.json': extra, 'qdrant/stats.json': {'avg_chunks': 0.5}}, on_disk) == [
         'qdrant/sample.json'
     ]
-    # Exact answers (stats, documents, refusals, ...) stay exact.
+    # Exact answers (stats, list_documents, refusals, ...) stay exact.
     assert gen.differences({'qdrant/sample.json': sample, 'qdrant/stats.json': {'avg_chunks': 0.5003}}, on_disk) == [
         'qdrant/stats.json'
     ]
@@ -182,6 +182,7 @@ class _FakeSide:
         self.calls = []
         self.wrong = wrong or {}
         self.stopped = False
+        self.trashed = set()
 
     def settings(self, node):
         comp = next(c for c in self.pipe['components'] if c['id'] == node)
@@ -199,7 +200,7 @@ class _FakeSide:
             return {'success': False, 'code': 'NOT_FOUND', 'error': 'no such document'}
         if name == 'search' and len(inp.get('vector') or []) == 10:
             return {'success': False, 'code': 'DIMENSION_MISMATCH', 'error': 'dimension'}
-        if name == 'remove_document':
+        if name in ('delete', 'soft_delete', 'restore'):
             settings = self.settings(node)
             if not settings.get('allow_write', True):
                 return {'success': False, 'error': f'no handler for {name} on {node}'}
@@ -209,6 +210,15 @@ class _FakeSide:
                 return {'success': False, 'code': 'WRITES_DISABLED', 'error': 'switch'}
             if source != 'tools_1':
                 return {'success': False, 'code': 'WRITES_SOURCE', 'error': 'source'}
+            ids = list(inp.get('object_ids') or [])
+            if name == 'soft_delete':
+                self.trashed.update(ids)
+            elif name == 'restore':
+                self.trashed.difference_update(ids)
+            elif inp.get('deleted_only'):
+                return {'success': True, 'kept_live': [oid for oid in ids if oid not in self.trashed]}
+        if name == 'chunks' and inp.get('object_id') in self.trashed:
+            return {'success': False, 'code': 'IN_TRASH', 'error': 'in the trash', 'object_id': inp['object_id']}
         if name == 'sample':
             return {'success': True, 'sample_id': 's-7-0000aaaa', 'n': 12, 'of': {'chunks': 12, 'documents': 8}}
         return {'success': True}
@@ -244,17 +254,17 @@ def test_every_capture_states_its_expected_outcome_and_writes_go_last():
     out = gen._captures_for(_TP, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
     assert out and all(name.startswith('qdrant/') for name in out)
     names = [c[0] for c in side.calls]
-    first_write = names.index('remove_document')
-    assert set(names[first_write:]) == {'remove_document'}, 'every refused write comes after the reads'
+    first_write = names.index('delete')
+    assert set(names[first_write:]) == {'delete'}, 'every refused write comes after the reads'
     # A refused write that the gate wrongly let through must not remove a real document.
     for name, inp, source, node in side.calls:
-        if name == 'remove_document' and (source, node) != ('tools_1', 'store_1'):
+        if name == 'delete' and (source, node) != ('tools_1', 'store_1'):
             assert inp['object_ids'] == [gen.disposable_id(_TP)], (source, node, inp)
 
 
 def test_generation_fails_when_a_refusal_is_answered_as_success():
-    side = _FakeSide(wrong={('remove_document', 'chat_1', 'store_1'): {'success': True, 'removed': {'chunks': 0}}})
-    with pytest.raises(gen.CaptureMismatch, match='remove_document.writes_source'):
+    side = _FakeSide(wrong={('delete', 'chat_1', 'store_1'): {'success': True, 'removed_chunks': 0}})
+    with pytest.raises(gen.CaptureMismatch, match='delete.writes_source'):
         gen._captures_for(_TP, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
 
 
@@ -276,30 +286,45 @@ def test_every_required_capture_is_generated_for_both_sides():
     out = gen._backend_captures(_TP, new, legacy, 'qdrant', 'multi', 'second', [0.1] * 384, [0.2] * 384)
     missing = sorted(set(gen.required_captures('qdrant')) - set(out))
     assert missing == [], f'the coverage test demands captures the generator never writes: {missing}'
-    # Each side removes a document of its own last, after every read of that side.
+    # Each side ends with its trash chain on 'second' and a plain delete, after every read of that side.
     for side in (new, legacy):
-        removal = [
-            i for i, c in enumerate(side.calls) if c[0] == 'remove_document' and c[1] == {'object_ids': ['second']}
-        ]
-        assert removal == [len(side.calls) - 1], side.calls[-3:]
+        tail = [(c[0], c[1]) for c in side.calls[-6:]]
+        assert tail == [
+            ('soft_delete', {'object_ids': ['second']}),
+            ('chunks', {'object_id': 'second'}),
+            ('restore', {'object_ids': ['second']}),
+            ('soft_delete', {'object_ids': ['second']}),
+            ('delete', {'object_ids': ['second', 'multi'], 'deleted_only': True}),
+            ('delete', {'object_ids': [_TP.object_id(gen.WIRE_PREFIX + gen.WIRE_THIRD)]}),
+        ], side.calls[-6:]
+    for name in ('soft_delete', 'restore', 'chunks.in_trash', 'delete', 'delete.deleted_only'):
+        assert f'qdrant/{name}.json' in out and f'qdrant/{name}.legacy.json' in out, name
+    assert out['qdrant/chunks.in_trash.json']['code'] == 'IN_TRASH'
+    assert out['qdrant/delete.deleted_only.json']['kept_live'] == ['multi']
+
+
+def test_a_trash_write_that_fails_stops_generation():
+    new = _FakeSide(wrong={('restore', 'tools_1', 'store_1'): {'success': False, 'code': 'STORE_ERROR', 'error': 'x'}})
+    with pytest.raises(gen.CaptureMismatch, match='restore'):
+        gen._backend_captures(_TP, new, _FakeSide(), 'qdrant', 'multi', 'second', [0.1] * 384, [0.2] * 384)
 
 
 def test_writes_disabled_is_store_2s_refusal_except_on_rocketride_vector():
-    disabled = gen.file_name('qdrant', 'remove_document', 'writes_disabled')
+    disabled = gen.file_name('qdrant', 'delete', 'writes_disabled')
     tp, side = _FakeToolpath(), _FakeSide(template='qdrant')
     out = gen._captures_for(tp, side, 'new', 'qdrant', 'multi', [0.1] * 384, [0.2] * 384)
     assert out[disabled]['code'] == 'WRITES_DISABLED'
-    assert ('remove_document', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_2') in side.calls
+    assert ('delete', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_2') in side.calls
     assert tp.started == []
 
     # rocketride_vector's store_2 keeps allow_write off, so it has no write tools to refuse with:
     # the refusal comes from a copy of the side's pipeline, store_1 with allow_writes off.
-    disabled = gen.file_name('rocketride_vector', 'remove_document', 'writes_disabled.legacy')
+    disabled = gen.file_name('rocketride_vector', 'delete', 'writes_disabled.legacy')
     tp, side = _FakeToolpath(), _FakeSide(template='rocketride_vector', kind='legacy', collection='vx_legacy')
     assert side.settings('store_2')['allow_write'] is False
     pipe_before = json.dumps(side.pipe, sort_keys=True)
     out = gen._captures_for(tp, side, 'legacy', 'rocketride_vector', 'multi', [0.1] * 384, [0.2] * 384)
-    assert not [c for c in side.calls if c[0] == 'remove_document' and c[3] == 'store_2']
+    assert not [c for c in side.calls if c[0] == 'delete' and c[3] == 'store_2']
     (copy,) = tp.started
     assert (copy.engine, copy.template, copy.kind, copy.collection) == (
         side.engine,
@@ -311,14 +336,14 @@ def test_writes_disabled_is_store_2s_refusal_except_on_rocketride_vector():
     assert copy.settings('store_1') == {**side.settings('store_1'), 'allow_write': True, 'allow_writes': False}
     assert copy.pipe['project_id'] != side.pipe.get('project_id') and copy.pipe['name'].endswith('(writes off)')
     assert json.dumps(side.pipe, sort_keys=True) == pipe_before, "the side's own pipeline is not changed"
-    assert copy.calls == [('remove_document', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_1')]
+    assert copy.calls == [('delete', {'object_ids': [gen.disposable_id(tp)]}, 'tools_1', 'store_1')]
     assert copy.stopped
     assert out[disabled]['code'] == 'WRITES_DISABLED'
 
 
 def test_a_writes_off_copy_that_removes_fails_generation_and_is_still_stopped():
-    tp = _FakeToolpath(wrong={('remove_document', 'tools_1', 'store_1'): {'success': True, 'removed': {'chunks': 0}}})
-    with pytest.raises(gen.CaptureMismatch, match='remove_document.writes_disabled'):
+    tp = _FakeToolpath(wrong={('delete', 'tools_1', 'store_1'): {'success': True, 'removed_chunks': 0}})
+    with pytest.raises(gen.CaptureMismatch, match='delete.writes_disabled'):
         gen._captures_for(
             tp, _FakeSide(template='rocketride_vector'), 'new', 'rocketride_vector', 'multi', [0.1] * 384, [0.2] * 384
         )

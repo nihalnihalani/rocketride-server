@@ -12,6 +12,7 @@
   "documents_without_first_chunk": 1,
   "chunks": 34,
   "deleted_chunks": 0,
+  "deleted_documents": 0,
   "raw_count": 35,
   "tables": 3,
   "avg_chunks_per_document": 4.25,

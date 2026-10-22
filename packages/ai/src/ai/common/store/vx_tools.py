@@ -26,14 +26,17 @@
 """The Vector Explorer tools on every vector store node, and the wrapper all store tools run in.
 
 ``VectorExplorerTools`` is mixed into ``VectorStoreToolMixin`` (``document_store``),
-so every store node that exposes the six agent tools (``search``, ``upsert``,
-``delete``, ``objdir``, ``get``, ``stats``) also answers the explorer's tools:
-``dialect``, ``documents``, ``chunks``, ``vectors``, ``sample``, ``project``,
-``neighbors`` and ``remove_document``. The explorer tools are listed for external
-(DAP) callers only (``audience=('dap',)``), so an agent's tool catalog does not
-change. The read tools first run ``vx_write_gate.check_read`` (a connection
-signed in with a task's public key is refused with ``READS_PUBLIC``);
-``remove_document`` runs the write gate.
+so every store node that exposes the agent tools (develop's ``search``, ``upsert``,
+``delete``, ``objdir``, ``get`` and ``stats``, and ``list_documents``,
+``soft_delete`` and ``restore``, all defined on ``VectorStoreToolMixin``) also
+answers the explorer's tools: ``dialect``, ``chunks``, ``vectors``, ``sample``,
+``project`` and ``neighbors`` (and, from ``vx_tools_ext``, ``recommend`` and
+``similarity_matrix``). The explorer tools are listed for external (DAP) callers
+only (``audience=('dap',)``). The read tools first run
+``vx_write_gate.check_read`` (a connection signed in with a task's public key is
+refused with ``READS_PUBLIC``); the write tools run the write gate. The bodies of
+``list_documents``, ``soft_delete`` and ``restore`` are the helpers here
+(``_vx_list_documents``, ``_vx_trash_write``).
 
 Every tool, new and legacy, runs inside :func:`vectordb_tool`: the input is
 normalised, a refusal or failure becomes ``{success: false, code, error}``
@@ -94,8 +97,8 @@ CONTRACT_VERSION = 'vector/1'
 #: Largest answer a store tool returns; a bigger one is refused with LIMIT_EXCEEDED.
 MAX_ANSWER_BYTES = 8 * 1024 * 1024
 
-#: The tools that change data (gated by ``vx_write_gate``).
-WRITE_TOOLS = ('remove_document', 'delete', 'upsert')
+#: The tools that change data (gated by ``vx_write_gate``; ``dialect.write_tools``): the gate's own list.
+WRITE_TOOLS = vx_write_gate.WRITE_TOOLS
 
 #: Most rows ``objdir`` scans through ``listDocumentPage`` to fill one answer.
 OBJDIR_SCAN_MAX = 10000
@@ -867,6 +870,13 @@ class _VxState:
             self.counts = None
             self.counts_as_of = None
 
+    def forget_samples(self) -> None:
+        """Drop the cached samples, so no tool serves a point that was removed or moved to the trash."""
+        with self.lock:
+            samples = self._samples
+        if samples is not None:
+            samples.clear()
+
 
 _STATE_LOCK = threading.Lock()
 
@@ -1148,7 +1158,9 @@ class VectorExplorerTools:
             'search_keyword': has('search_keyword'),
             'remove': True,
             'remove_count': has('removeCounted') or has('countChunks'),
-            'soft_delete': False,
+            # Every driver implements markDeleted / markActive (they are abstract), so the
+            # trash tools work on every store.
+            'soft_delete': True,
             # Additive extensions (contract section 4.4): the node computes clusters wherever it
             # samples; a driver declares the other two in VX_DRIVER_CAPABILITIES once it serves them.
             'clusters': sample,
@@ -1347,6 +1359,10 @@ class VectorExplorerTools:
             without_first = max(0, documents - first)
         chunks = self._vx_count(store.countChunks, deletedFilter('active'))
         deleted_chunks = self._vx_count(store.countChunks, deletedFilter('deleted'))
+        # Documents with a chunk in the trash: the Trash listing's size.
+        deleted_documents = self._vx_count(store.countDocumentsWhere, deletedFilter('deleted'))
+        if deleted_documents is None and 'documents_by_first_chunk' in caveats:
+            deleted_documents = self._vx_count(store.countChunks, deletedFilter('deleted', chunkIds=[0]))
         tables = self._vx_count(store.countChunks, deletedFilter('active', isTable=True))
         if documents is None and chunks is None and deleted_chunks is None and tables is None:
             caveats.append('no_filtered_count')
@@ -1355,6 +1371,7 @@ class VectorExplorerTools:
             'documents_without_first_chunk': without_first,
             'chunks': chunks,
             'deleted_chunks': deleted_chunks,
+            'deleted_documents': deleted_documents,
             'tables': tables,
             'avg_chunks_per_document': _round(chunks / documents, 5) if chunks is not None and documents else None,
             'caveats': caveats,
@@ -1380,6 +1397,7 @@ class VectorExplorerTools:
                 'documents_without_first_chunk': None,
                 'chunks': None,
                 'deleted_chunks': None,
+                'deleted_documents': None,
                 'raw_count': None,
                 'tables': None,
                 'avg_chunks_per_document': None,
@@ -1411,6 +1429,7 @@ class VectorExplorerTools:
             'documents_without_first_chunk': figures['documents_without_first_chunk'],
             'chunks': figures['chunks'],
             'deleted_chunks': figures['deleted_chunks'],
+            'deleted_documents': figures['deleted_documents'],
             'raw_count': count,
             'tables': figures['tables'],
             'avg_chunks_per_document': figures['avg_chunks_per_document'],
@@ -1424,59 +1443,98 @@ class VectorExplorerTools:
         return answer
 
     # ------------------------------------------------------------------
-    # documents
+    # list_documents (the tool is VectorStoreToolMixin.list_documents)
     # ------------------------------------------------------------------
 
-    @tool_function(
-        input_schema={
-            'type': 'object',
-            'properties': {
-                'cursor': {'type': ['string', 'null'], 'description': 'next_cursor of the previous page.'},
-                'limit': {'type': 'integer', 'description': 'Documents per page (default 200, at most 500).'},
-                'object_ids': {'type': ['array', 'null'], 'items': {'type': 'string'}},
-                'deleted': _DELETED_SCHEMA,
-                'sort': {'type': 'string', 'enum': ['path']},
-                'filter': {
-                    'type': ['object', 'null'],
-                    'description': 'Restrict the listing; the answer says how much of it the store applied.',
-                    'properties': {
-                        'path_prefix': {'type': ['string', 'null']},
-                        'file_types': {'type': ['array', 'null'], 'items': {'type': 'string'}},
-                        'ingested_after': {'type': ['string', 'null']},
-                        'ingested_before': {'type': ['string', 'null']},
-                        'min_chunks': {'type': ['integer', 'null']},
-                        'max_chunks': {'type': ['integer', 'null']},
-                        'has_first_chunk': {'type': ['boolean', 'null']},
-                        'has_tables': {'type': ['boolean', 'null']},
-                        'path_contains': {'type': ['string', 'null']},
-                    },
+    #: The input of ``list_documents`` (the explorer's directory listing; also #2704's callers' forms).
+    LIST_DOCUMENTS_INPUT: Dict[str, Any] = {
+        'type': 'object',
+        'properties': {
+            'cursor': {
+                'type': ['string', 'null'],
+                'description': 'next_cursor of the previous page (null for the first).',
+            },
+            'limit': {'type': 'integer', 'description': 'Documents per page (default 200, at most 500).'},
+            'object_ids': {'type': ['array', 'null'], 'items': {'type': 'string'}},
+            'deleted': {
+                'description': (
+                    "'active' (default), 'deleted' (the trash: documents with a chunk in it) or 'all'; "
+                    'true and false stand for deleted and active.'
+                ),
+                'anyOf': [{'type': 'string', 'enum': ['active', 'deleted', 'all']}, {'type': 'boolean'}],
+            },
+            'parent': {
+                'type': ['string', 'null'],
+                'description': 'Only documents stored under exactly this parent path (a page may then hold fewer rows).',
+            },
+            'sort': {'type': 'string', 'enum': ['path']},
+            'filter': {
+                'type': ['object', 'null'],
+                'description': 'Restrict the listing; the answer says how much of it the store applied.',
+                'properties': {
+                    'path_prefix': {'type': ['string', 'null']},
+                    'file_types': {'type': ['array', 'null'], 'items': {'type': 'string'}},
+                    'ingested_after': {'type': ['string', 'null']},
+                    'ingested_before': {'type': ['string', 'null']},
+                    'min_chunks': {'type': ['integer', 'null']},
+                    'max_chunks': {'type': ['integer', 'null']},
+                    'has_first_chunk': {'type': ['boolean', 'null']},
+                    'has_tables': {'type': ['boolean', 'null']},
+                    'path_contains': {'type': ['string', 'null']},
                 },
             },
         },
-        output_schema={
-            'type': 'object',
-            'properties': {
-                **_ENVELOPE,
-                'items': {'type': 'array', 'items': {'type': 'object'}},
-                'next_cursor': {'type': ['string', 'null']},
-                'total': {'type': ['integer', 'null']},
-                'counts_exact': {'type': 'boolean'},
-                'distinct': {'type': 'boolean'},
-                'sorted': {'type': 'boolean'},
-                'filter_applied': {'type': 'string', 'enum': list(FILTER_APPLIED_VALUES)},
-                'filter_ignored': {'type': 'array', 'items': {'type': 'string'}},
-                'caveats': {'type': 'array', 'items': {'type': 'string'}},
+    }
+
+    #: The answer of ``list_documents``.
+    LIST_DOCUMENTS_OUTPUT: Dict[str, Any] = {
+        'type': 'object',
+        'properties': {
+            **_ENVELOPE,
+            'items': {
+                'type': 'array',
+                'description': (
+                    'One row per document: objectId, path, chunks, has_first_chunk, tables, deleted, nodeId, '
+                    'size, modifyTime, ingestedAt, pointId, max_chunk_id, deleted_chunks.'
+                ),
+                'items': {'type': 'object'},
             },
+            'next_cursor': {
+                'type': ['string', 'null'],
+                'description': 'Pass it as cursor for the next page; null at the end.',
+            },
+            'total': {
+                'type': ['integer', 'null'],
+                'description': 'Documents in the whole listing, where the store counts them.',
+            },
+            'counts_exact': {'type': 'boolean'},
+            'distinct': {'type': 'boolean'},
+            'sorted': {'type': 'boolean'},
+            'filter_applied': {'type': 'string', 'enum': list(FILTER_APPLIED_VALUES)},
+            'filter_ignored': {'type': 'array', 'items': {'type': 'string'}},
+            'caveats': {'type': 'array', 'items': {'type': 'string'}},
         },
-        description='List the documents in this vector store, one row per document with its path and chunk count.',
-        audience=('dap',),
-    )
-    @vectordb_tool
-    def documents(self, args):
-        """One page of the document directory."""
+    }
+
+    def _vx_list_documents(self, args: Mapping[str, Any]) -> Dict[str, Any]:
+        """One page of the document directory (the body of ``list_documents``).
+
+        ``deleted`` also takes #2704's booleans; ``parent`` keeps the documents stored under
+        exactly that path (handed to the driver as a ``path_prefix`` where it filters, then
+        matched exactly here, so ``total`` is null); an ``offset`` other than 0 is refused,
+        since the listing pages with ``cursor``.
+        """
         vx_write_gate.check_read()
         store = self._vx_store()
         warnings: List[str] = []
+        offset = args.get('offset')
+        if offset is not None and (isinstance(offset, bool) or offset != 0):
+            raise _invalid('list_documents pages with cursor: pass the next_cursor of the previous page, not offset.')
+        parent = args.get('parent')
+        if parent is not None and not isinstance(parent, str):
+            raise _invalid('parent must be a string.')
+        if isinstance(args.get('deleted'), bool):
+            args = {**args, 'deleted': 'deleted' if args['deleted'] else 'active'}
         cursor = args.get('cursor')
         if cursor is not None:
             if not isinstance(cursor, str):
@@ -1498,8 +1556,13 @@ class VectorExplorerTools:
         doc_filter = _doc_list_filter_arg(args)
         # Only a driver that declares documents_filter is handed the filter: the others keep
         # the closed keyword-only signature of the first contract and are filtered by the app.
-        hand_over = doc_filter is not None and 'documents_filter' in store.capabilities()
-        hook_args: Dict[str, Any] = {'filter': doc_filter} if hand_over else {}
+        filters = 'documents_filter' in store.capabilities()
+        hook_filter = doc_filter
+        if parent is not None and filters and (doc_filter is None or doc_filter.path_prefix is None):
+            # The exact parent narrows the driver's listing as a prefix; the exact match is below.
+            hook_filter = dataclasses.replace(doc_filter or DocListFilter(), path_prefix=parent)
+        hand_over = hook_filter is not None and filters
+        hook_args: Dict[str, Any] = {'filter': hook_filter} if hand_over else {}
         page = store.listDocumentPage(
             cursor=cursor, limit=limit, object_ids=object_ids, deleted=deleted, sort=sort, **hook_args
         )
@@ -1522,7 +1585,7 @@ class VectorExplorerTools:
                 'deleted_chunks': _whole_number(getattr(row, 'deleted_chunks', None)),
             }
             for row in page.items
-            if row.objectId != CONTROL_OBJECT_ID
+            if row.objectId != CONTROL_OBJECT_ID and (parent is None or row.path == parent)
         ]
         caveats = list(page.caveats)
         if not page.sorted and 'documents_unsorted' not in caveats:
@@ -1531,13 +1594,16 @@ class VectorExplorerTools:
             'success': True,
             'items': items,
             'next_cursor': page.next_cursor,
-            'total': page.total,
+            'total': page.total if parent is None else None,
             'counts_exact': page.counts_exact,
             'distinct': page.distinct,
             'sorted': page.sorted,
         }
         if doc_filter is not None:
-            skipped = (getattr(page, 'filter_ignored', None) or ()) if hand_over else None
+            skipped = (getattr(page, 'filter_ignored', None) or ()) if hand_over and hook_filter is doc_filter else None
+            if hand_over and hook_filter is not doc_filter:
+                # Only the keys the caller gave are reported, so the added path_prefix is not.
+                skipped = [key for key in (getattr(page, 'filter_ignored', None) or ()) if key in doc_filter.given()]
             applied, ignored = _filter_outcome(doc_filter, skipped)
             answer['filter_applied'] = applied
             answer['filter_ignored'] = ignored
@@ -1597,6 +1663,9 @@ class VectorExplorerTools:
             raise not_found
         page = store.scrollChunks(object_id, after_chunk=after, limit=limit, deleted=deleted)
         if not page.docs and not page.has_more and after == -1:
+            # No live chunk: a document whose chunks are all in the trash is told apart.
+            if deleted == 'active' and self._vx_in_trash(store, object_id):
+                raise self._vx_in_trash_refusal('chunks', object_id)
             raise not_found
         items = []
         for doc in page.docs:
@@ -2419,56 +2488,81 @@ class VectorExplorerTools:
             state.neighbors_busy.release()
 
     # ------------------------------------------------------------------
-    # remove_document
+    # soft_delete and restore (the tools are VectorStoreToolMixin.soft_delete and .restore)
     # ------------------------------------------------------------------
 
-    @tool_function(
-        input_schema={
-            'type': 'object',
-            'required': ['object_ids'],
-            'properties': {
-                'object_ids': {
-                    'type': 'array',
-                    'items': {'type': 'string'},
-                    'minItems': 1,
-                    'maxItems': 100,
-                    'description': 'Documents to remove, every chunk of each.',
-                }
-            },
-        },
-        output_schema={
-            'type': 'object',
-            'properties': {
-                **_ENVELOPE,
-                'removed': {'type': 'array'},
-                'not_found': {'type': 'array', 'items': {'type': 'string'}},
-                'removed_chunks': {'type': ['integer', 'null']},
-                'audit': {'type': 'object'},
-            },
-        },
-        description='Remove documents (every chunk of each) and report the rows removed. Gated by allow_writes.',
-        audience=('dap',),
-    )
-    @vectordb_tool
-    def remove_document(self, args):
-        """Remove whole documents by objectId (gated)."""
+    @staticmethod
+    def _vx_write_ids(tool: str, raw: Any, decision: Any) -> List[str]:
+        """The distinct, stripped ids of a write call, in request order; non-agent callers send at most ``write_ids_max``."""
+        if not isinstance(raw, list) or not raw:
+            raise _invalid(f'{tool} requires a non-empty "object_ids" array')
+        clean = [str(oid).strip() for oid in raw if str(oid).strip()]
+        if not clean:
+            raise _invalid(f'{tool}: no valid object IDs provided')
+        if decision.origin != 'agent' and len(clean) > LIMITS['write_ids_max']:
+            raise _invalid(f'object_ids must be a list of 1 to {LIMITS["write_ids_max"]} strings.')
+        return list(dict.fromkeys(clean))
+
+    def _vx_trash_write(self, tool: str, args: Mapping[str, Any], *, deleted: bool) -> Dict[str, Any]:
+        """The body of ``soft_delete`` (``deleted``) and ``restore``: the gate, the ids, one driver call.
+
+        ``matched_chunks`` is what the driver's ``markDeleted`` / ``markActive`` answers: the
+        chunks the call moved into or out of the trash (0 for a document already in that
+        state), or None where the store cannot count. ``not_found`` names the ids with no
+        chunk stored at all; restoring a document that is not in the trash moves nothing.
+        """
         store = self._vx_store()
         # The gate runs first (on the ids as sent), then the input is checked.
         decision = vx_write_gate.check_write(
-            'remove_document',
-            object_ids=_gate_ids(args.get('object_ids')),
-            allow_writes=self._vx_allow_writes(),
+            tool, object_ids=_gate_ids(args.get('object_ids')), allow_writes=self._vx_allow_writes()
         )
-        ids = _strings_arg(args.get('object_ids'), 'object_ids', LIMITS['write_ids_max'])
-        removed, not_found, rows = self._vx_remove(store, ids)
-        self._vx_log_write('vector.remove_document', ids, rows, decision.origin)
+        ids = self._vx_write_ids(tool, args.get('object_ids'), decision)
+        per = {oid: self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid])) for oid in ids}
+        if len(ids) <= LIMITS['write_ids_max']:
+            for oid in ids:
+                if per[oid] is None and not self._vx_document_stored(store, oid):
+                    per[oid] = 0
+        not_found = [oid for oid in ids if per[oid] == 0]
+        targets = [oid for oid in ids if per[oid] != 0]
+        matched: Optional[int] = 0
+        if targets:
+            matched = _int_or_none(store.markDeleted(targets) if deleted else store.markActive(targets))
+        action = f'vector.{tool}'
+        self._vx_log_write(action, ids, matched, decision.origin)
         return {
             'success': True,
-            'removed': removed,
+            'object_ids': ids,
+            'matched_chunks': matched,
             'not_found': not_found,
-            'removed_chunks': rows,
-            'audit': self._vx_audit('vector.remove_document', store, ids, rows, decision),
+            'audit': self._vx_audit(action, store, ids, matched, decision),
         }
+
+    def _vx_has_live_chunk(self, store: Any, object_id: str) -> bool:
+        """Whether ``object_id`` has a chunk out of the trash (``delete {deleted_only}`` keeps such a document)."""
+        live = self._vx_count(store.countChunks, deletedFilter('active', objectIds=[object_id]))
+        if live is not None:
+            return live > 0
+        return any(
+            metadataValue(doc, 'objectId') == object_id
+            for doc in store.get(deletedFilter('active', objectIds=[object_id], limit=1, offset=0))
+        )
+
+    def _vx_in_trash(self, store: Any, object_id: str) -> bool:
+        """Whether ``object_id`` has a chunk in the trash (read when it has no live one: then all are there)."""
+        if object_id == CONTROL_OBJECT_ID:
+            return False
+        return any(
+            metadataValue(doc, 'objectId') == object_id
+            for doc in store.get(deletedFilter('deleted', objectIds=[object_id], limit=1, offset=0))
+        )
+
+    @staticmethod
+    def _vx_in_trash_refusal(tool: str, object_id: str) -> ToolRefusal:
+        return ToolRefusal(
+            'IN_TRASH',
+            f"{tool}: the document '{object_id}' is in the trash; restore it to read it",
+            {'object_id': object_id},
+        )
 
 
 __all__ = [

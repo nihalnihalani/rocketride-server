@@ -96,6 +96,194 @@
   }
  },
  {
+  "description": "Demo corpus List the documents in this vector database one by one (equal paths are not collapsed), each with its path and chunk count, in pages ordered by path. Follow next_cursor for the next page. deleted='deleted' (or true) lists the trash; parent keeps one exact path.",
+  "inputSchema": {
+   "properties": {
+    "cursor": {
+     "description": "next_cursor of the previous page (null for the first).",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "deleted": {
+     "anyOf": [
+      {
+       "enum": [
+        "active",
+        "deleted",
+        "all"
+       ],
+       "type": "string"
+      },
+      {
+       "type": "boolean"
+      }
+     ],
+     "description": "'active' (default), 'deleted' (the trash: documents with a chunk in it) or 'all'; true and false stand for deleted and active."
+    },
+    "filter": {
+     "description": "Restrict the listing; the answer says how much of it the store applied.",
+     "properties": {
+      "file_types": {
+       "items": {
+        "type": "string"
+       },
+       "type": [
+        "array",
+        "null"
+       ]
+      },
+      "has_first_chunk": {
+       "type": [
+        "boolean",
+        "null"
+       ]
+      },
+      "has_tables": {
+       "type": [
+        "boolean",
+        "null"
+       ]
+      },
+      "ingested_after": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "ingested_before": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "max_chunks": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "min_chunks": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "path_contains": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "path_prefix": {
+       "type": [
+        "string",
+        "null"
+       ]
+      }
+     },
+     "type": [
+      "object",
+      "null"
+     ]
+    },
+    "limit": {
+     "description": "Documents per page (default 200, at most 500).",
+     "type": "integer"
+    },
+    "object_ids": {
+     "items": {
+      "type": "string"
+     },
+     "type": [
+      "array",
+      "null"
+     ]
+    },
+    "parent": {
+     "description": "Only documents stored under exactly this parent path (a page may then hold fewer rows).",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "sort": {
+     "enum": [
+      "path"
+     ],
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "name": "list_documents",
+  "outputSchema": {
+   "properties": {
+    "caveats": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "code": {
+     "type": "string"
+    },
+    "counts_exact": {
+     "type": "boolean"
+    },
+    "distinct": {
+     "type": "boolean"
+    },
+    "error": {
+     "type": "string"
+    },
+    "filter_applied": {
+     "enum": [
+      "server",
+      "partial",
+      "none"
+     ],
+     "type": "string"
+    },
+    "filter_ignored": {
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "items": {
+     "description": "One row per document: objectId, path, chunks, has_first_chunk, tables, deleted, nodeId, size, modifyTime, ingestedAt, pointId, max_chunk_id, deleted_chunks.",
+     "items": {
+      "type": "object"
+     },
+     "type": "array"
+    },
+    "next_cursor": {
+     "description": "Pass it as cursor for the next page; null at the end.",
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "sorted": {
+     "type": "boolean"
+    },
+    "success": {
+     "type": "boolean"
+    },
+    "total": {
+     "description": "Documents in the whole listing, where the store counts them.",
+     "type": [
+      "integer",
+      "null"
+     ]
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
   "description": "Demo corpus List unique document paths stored in this vector database.",
   "inputSchema": {
    "properties": {
@@ -122,6 +310,57 @@
     "paths": {
      "description": "Map of unique parent paths to their object IDs.",
      "type": "object"
+    },
+    "success": {
+     "type": "boolean"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Take documents out of the trash by object ID, so their chunks are searchable and readable again. A document not in the trash is left as it is; one removed with delete cannot be restored.",
+  "inputSchema": {
+   "properties": {
+    "object_ids": {
+     "description": "Object IDs of the documents to take out of the trash.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "object_ids"
+   ],
+   "type": "object"
+  },
+  "name": "restore",
+  "outputSchema": {
+   "properties": {
+    "audit": {
+     "type": "object"
+    },
+    "matched_chunks": {
+     "description": "Chunks the call took out of the trash (0 for documents not in it), or null when the store does not count.",
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "not_found": {
+     "description": "Object IDs with nothing stored.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "object_ids": {
+     "description": "The distinct object IDs the request named, in the order given.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
     },
     "success": {
      "type": "boolean"
@@ -206,6 +445,57 @@
     },
     "total": {
      "type": "integer"
+    }
+   },
+   "type": "object"
+  }
+ },
+ {
+  "description": "Demo corpus Move documents to the trash by object ID: their chunks stay stored but leave search, objdir, get and the active listing until restore. delete removes them for good instead.",
+  "inputSchema": {
+   "properties": {
+    "object_ids": {
+     "description": "Object IDs of the documents to move to the trash.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "object_ids"
+   ],
+   "type": "object"
+  },
+  "name": "soft_delete",
+  "outputSchema": {
+   "properties": {
+    "audit": {
+     "type": "object"
+    },
+    "matched_chunks": {
+     "description": "Chunks the call moved to the trash (0 for documents already there), or null when the store does not count.",
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "not_found": {
+     "description": "Object IDs with nothing stored.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "object_ids": {
+     "description": "The distinct object IDs the request named, in the order given.",
+     "items": {
+      "type": "string"
+     },
+     "type": "array"
+    },
+    "success": {
+     "type": "boolean"
     }
    },
    "type": "object"

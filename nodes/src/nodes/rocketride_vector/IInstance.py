@@ -26,8 +26,8 @@
 #
 # The lane handlers (questions, documents, render) and the store tools come
 # from the shared store base; nothing here is driver-specific. The tools sit
-# behind IGlobal.expose_tools, the write tools (upsert, delete,
-# remove_document) also behind IGlobal.allow_write, and every write then runs
+# behind IGlobal.expose_tools, the write tools (upsert, delete, soft_delete,
+# restore) also behind IGlobal.allow_write, and every write then runs
 # the store write gate (vx_write_gate.check_write), which fails closed.
 # ------------------------------------------------------------------------------
 from ai.common.store import StoreInstanceBase

@@ -590,15 +590,23 @@ def test_negatives_alone_on_qdrant_list_the_least_similar_first():
 
 
 def _sampled_then_removed(removed='doc00'):
-    """The mock Qdrant corpus, every chunk in a cached sample, then ``removed`` taken out through the tool."""
+    """The mock Qdrant corpus, every chunk in a cached sample, then ``removed`` taken out by another writer.
+
+    The node's own removals drop its cached samples (``test_vector_tool_set``), so the rows
+    go through the backend client here, as another engine writing to the same collection
+    would: this node's cache still holds them, and recommend must not use them.
+    """
     store = _qdrant_corpus()
     inst = node(store, logical_type='qdrant')
     assert inst.sample({'n': 30, 'seed': 3})['success'] is True
     latest = vx_tools._vx_state(store).samples().latest()
     assert all((removed, chunk) in latest.index for chunk in range(5)), 'the sample holds every chunk of it'
-    gone = _dispatch(_tool_node(store, allow_writes=True), 'remove_document', {'object_ids': [removed]}, dap())
-    assert gone['success'] is True and gone['removed_chunks'] == 5, gone
-    assert vx_tools._vx_state(store).samples().latest() is latest, 'and still does after the removal'
+    selector = qdrant.Filter(
+        must=[qdrant.FieldCondition(key='meta.objectId', match=qdrant.models.MatchAny(any=[removed]))]
+    )
+    store.client.delete(collection_name=store.collection, points_selector=selector, wait=True)
+    assert inst.chunks({'object_id': removed})['code'] == 'NOT_FOUND', 'the document is gone from the store'
+    assert vx_tools._vx_state(store).samples().latest() is latest, 'and the sample still holds it'
     return store, inst
 
 

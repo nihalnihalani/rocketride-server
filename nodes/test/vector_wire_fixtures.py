@@ -18,7 +18,7 @@ ids, caller ids, sizes, cursors, sample ids) are replaced by ``"<scrubbed>"``
 (a null stays null); every file lists the keys it scrubbed in ``__scrub__``.
 The upload names are fixed (``C:/demo/<folder>/<file>``), so objectIds are
 too, and the legacy copy's point ids are derived, not random, so a listing in
-point-id order is the same on every run. A ``documents`` page that says
+point-id order is the same on every run. A ``list_documents`` page that says
 ``sorted: false`` is compared as a set of documents; the samples ask for more
 points than the corpus has chunks (``WIRE_SAMPLE_N``), and generation fails
 when a sample holds fewer, because a partial sample may be filled at random.
@@ -33,7 +33,11 @@ Every capture is taken for an expected outcome (``EXPECTED``: success, or the
 refusal code), and generation stops with ``CaptureMismatch`` when a tool
 answers otherwise, so a broken gate is never committed as the reference. The
 writes that must be refused run after every read and target an objectId
-nothing was uploaded under (``disposable_id``).
+nothing was uploaded under (``disposable_id``). The writes that succeed run
+last on each side, in one chain on one document: ``soft_delete``, the
+``chunks`` refusal of a trashed document (``IN_TRASH``), ``restore``, then
+``delete {deleted_only}`` of it with a live document beside it (``kept_live``),
+and a plain ``delete`` of a third document.
 
 ``test_vector_wire_fixtures_full.py`` regenerates the captures and compares
 them with the committed files. To regenerate, from ``nodes/`` (unmocked, with
@@ -88,7 +92,7 @@ WIRE_LEGACY = 'vx_tp_wire_legacy'
 WIRE_SAMPLE_N = 500
 
 # The tools every backend has a capture of, on the new and on the legacy side.
-REQUIRED_TOOLS = ('dialect', 'stats', 'documents', 'chunks', 'sample', 'search', 'remove_document')
+REQUIRED_TOOLS = ('dialect', 'stats', 'list_documents', 'chunks', 'sample', 'search', 'delete')
 
 # The corpus's one keyword token (demo/gen_corpus.py KEYWORD_TOKEN, in ops/memo_q3.txt).
 WIRE_KEYWORD = 'KX4471'
@@ -108,9 +112,10 @@ EXPECTED: Dict[Tuple[str, Optional[str]], str] = {
     ('dialect', None): OK,
     ('stats', None): OK,
     ('stats', 'quick'): OK,
-    ('documents', None): OK,
+    ('list_documents', None): OK,
     ('chunks', None): OK,
     ('chunks', 'not_found'): 'NOT_FOUND',
+    ('chunks', 'in_trash'): 'IN_TRASH',
     ('vectors', None): OK,
     ('sample', None): OK,
     ('sample', 'light'): OK,
@@ -119,12 +124,16 @@ EXPECTED: Dict[Tuple[str, Optional[str]], str] = {
     ('search', None): OK,
     ('search', 'below_floor'): OK,
     ('search', 'dimension_mismatch'): 'DIMENSION_MISMATCH',
-    ('remove_document', 'reserved_id'): 'RESERVED_ID',
-    ('remove_document', 'writes_source'): 'WRITES_SOURCE',
-    ('remove_document', 'writes_disabled'): 'WRITES_DISABLED',
+    ('delete', None): OK,
+    ('delete', 'deleted_only'): OK,
+    ('delete', 'reserved_id'): 'RESERVED_ID',
+    ('delete', 'writes_source'): 'WRITES_SOURCE',
+    ('delete', 'writes_disabled'): 'WRITES_DISABLED',
+    ('soft_delete', None): OK,
+    ('restore', None): OK,
     # The additive surface (contract section 4.4); see ENRICHED below.
     ('dialect', 'enriched'): OK,
-    ('documents', 'filter'): OK,
+    ('list_documents', 'filter'): OK,
     ('sample', 'clusters'): OK,
     ('search', 'keyword'): OK,
     ('recommend', None): OK,
@@ -147,7 +156,7 @@ BACKEND_EXPECTED: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {
 # so captures regenerate on a lane branch before the merge and gain the new files after it.
 ENRICHED: Dict[str, Tuple[Tuple[str, Optional[str]], ...]] = {
     '_NEEDS_DIALECT': (('dialect', 'enriched'), ('search', 'keyword')),
-    '_NEEDS_DOCUMENTS': (('documents', 'filter'),),
+    '_NEEDS_DOCUMENTS': (('list_documents', 'filter'),),
     '_NEEDS_SAMPLE_EXT': (('sample', 'clusters'),),
     '_NEEDS_EXT_TOOLS': (('recommend', None), ('recommend', 'best_score'), ('similarity_matrix', None)),
 }
@@ -313,7 +322,11 @@ def _captures_for(
     put('dialect', None, side.tool('dialect'))
     put('stats', None, side.tool('stats', {'mode': 'full'}))
     put('stats', 'quick', side.tool('stats', {'mode': 'quick'}))
-    put('documents', None, side.tool('documents', {'cursor': None, 'limit': 3, 'deleted': 'active', 'sort': 'path'}))
+    put(
+        'list_documents',
+        None,
+        side.tool('list_documents', {'cursor': None, 'limit': 3, 'deleted': 'active', 'sort': 'path'}),
+    )
     put('chunks', None, side.tool('chunks', {'object_id': multi, 'after_chunk': -1, 'limit': 2, 'deleted': 'active'}))
     put('chunks', 'not_found', side.tool('chunks', {'object_id': 'schema'}))
     put('vectors', None, side.tool('vectors', {'keys': [[multi, 0]]}))
@@ -351,13 +364,13 @@ def _captures_for(
         )
     if ('search', 'keyword') in enriched:
         put('search', 'keyword', side.tool('search', {'query': WIRE_KEYWORD, 'mode': 'keyword', 'top_k': 3}))
-    if ('documents', 'filter') in enriched:
+    if ('list_documents', 'filter') in enriched:
         prefix = WIRE_PREFIX + 'handbooks/'
         put(
-            'documents',
+            'list_documents',
             'filter',
             side.tool(
-                'documents',
+                'list_documents',
                 {'cursor': None, 'limit': 3, 'deleted': 'active', 'sort': 'path', 'filter': {'path_prefix': prefix}},
             ),
         )
@@ -377,16 +390,16 @@ def _captures_for(
         put('similarity_matrix', None, side.tool('similarity_matrix', {'keys': keys}))
     # Last, and on an id nothing was uploaded under: writes that must be refused.
     nobody = disposable_id(tp)
-    put('remove_document', 'writes_source', side.tool('remove_document', {'object_ids': [nobody]}, source='chat_1'))
-    put('remove_document', 'writes_disabled', _writes_disabled_answer(tp, side, nobody))
-    put('remove_document', 'reserved_id', side.tool('remove_document', {'object_ids': ['schema']}))
+    put('delete', 'writes_source', side.tool('delete', {'object_ids': [nobody]}, source='chat_1'))
+    put('delete', 'writes_disabled', _writes_disabled_answer(tp, side, nobody))
+    put('delete', 'reserved_id', side.tool('delete', {'object_ids': ['schema']}))
     if problems:
         raise CaptureMismatch('; '.join(problems))
     return out
 
 
 def _writes_disabled_answer(tp, side, nobody: str) -> Any:
-    """The WRITES_DISABLED refusal: a Tools-source removal on a store whose allow_writes is off.
+    """The WRITES_DISABLED refusal: a Tools-source ``delete`` on a store whose allow_writes is off.
 
     Every template's store_2 answers it, except rocketride_vector's. There store_2 keeps
     allow_write off, which hides its write tools (the engine finds no handler), because
@@ -395,7 +408,7 @@ def _writes_disabled_answer(tp, side, nobody: str) -> Any:
     allow_writes off and no agent wired, run as a side of its own and stopped afterwards.
     """
     if side.template != 'rocketride_vector':
-        return side.tool('remove_document', {'object_ids': [nobody]}, node='store_2')
+        return side.tool('delete', {'object_ids': [nobody]}, node='store_2')
     pipe = json.loads(json.dumps(side.pipe))
     pipe['project_id'] = str(uuid.uuid4())
     pipe['name'] = f'{pipe.get("name", "vx-wire")} (writes off)'
@@ -406,24 +419,53 @@ def _writes_disabled_answer(tp, side, nobody: str) -> Any:
     assert not any(str(comp.get('provider', '')).startswith('agent') for comp in pipe['components'])
     variant = tp._Side(side.engine, side.template, f'{side.kind}-writes-off', side.collection, pipe, ('tools_1',))
     try:
-        return variant.tool('remove_document', {'object_ids': [nobody]})
+        return variant.tool('delete', {'object_ids': [nobody]})
     finally:
         variant.stop()
+
+
+#: The third document of the wire corpus, removed by the plain ``delete`` capture.
+WIRE_THIRD = 'greenhouse/orchid_notes.txt'
+
+
+def _trash_captures(tp, side, backend: str, kind: str, live: str, second: str) -> Dict[str, Any]:
+    """The successful writes of one side, last (they change the data), in one chain on ``second``.
+
+    ``soft_delete`` moves it to the trash, ``chunks`` then refuses it with ``IN_TRASH``,
+    ``restore`` takes it back; moved to the trash again, ``delete {deleted_only}`` of it and
+    of ``live`` (a document with live chunks) removes it and keeps ``live`` (``kept_live``);
+    a plain ``delete`` removes the third document.
+    """
+    case = (lambda c: c) if kind == 'new' else (lambda c: f'{c}.legacy' if c else 'legacy')
+    out: Dict[str, Any] = {}
+
+    def put(tool: str, c: Optional[str], answer: Any) -> None:
+        name = file_name(backend, tool, case(c))
+        problem = outcome_problem(answer, expected_for(tool, c, backend))
+        if problem:
+            raise CaptureMismatch(f'{name}: {problem}')
+        out[name] = answer
+
+    put('soft_delete', None, side.tool('soft_delete', {'object_ids': [second]}))
+    put('chunks', 'in_trash', side.tool('chunks', {'object_id': second}))
+    put('restore', None, side.tool('restore', {'object_ids': [second]}))
+    again = side.tool('soft_delete', {'object_ids': [second]})
+    problem = outcome_problem(again, OK)
+    if problem:
+        raise CaptureMismatch(f'{backend} {kind}: soft_delete before delete.deleted_only: {problem}')
+    put('delete', 'deleted_only', side.tool('delete', {'object_ids': [second, live], 'deleted_only': True}))
+    put('delete', None, side.tool('delete', {'object_ids': [tp.object_id(WIRE_PREFIX + WIRE_THIRD)]}))
+    return out
 
 
 def _backend_captures(
     tp, new, legacy, backend: str, multi: str, second: str, water: List[float], unrelated: List[float]
 ) -> Dict[str, Any]:
-    """Both sides' captures, then on each side the removal of ``second`` (it changes the data, so it goes last)."""
+    """Both sides' captures, then on each side the trash and removal chain (it changes the data, so it goes last)."""
     out = _captures_for(tp, new, 'new', backend, multi, water, unrelated)
     out.update(_captures_for(tp, legacy, 'legacy', backend, second, water, unrelated))
-    for side, case in ((new, None), (legacy, 'legacy')):
-        name = file_name(backend, 'remove_document', case)
-        removed = side.tool('remove_document', {'object_ids': [second]})
-        problem = outcome_problem(removed, OK)
-        if problem:
-            raise CaptureMismatch(f'{name}: {problem}')
-        out[name] = removed
+    for side, kind in ((new, 'new'), (legacy, 'legacy')):
+        out.update(_trash_captures(tp, side, backend, kind, multi, second))
     return out
 
 
@@ -540,12 +582,12 @@ def _close(a: Any, b: Any, tolerance: float) -> bool:
 
 
 def _comparable(name: str, value: Any) -> Any:
-    """A documents page that says ``sorted: false`` compared as a set: its items ordered by objectId.
+    """A list_documents page that says ``sorted: false`` compared as a set: its items ordered by objectId.
 
     Such a backend lists in storage order (Qdrant: point-id order), which the
     answer itself declares unordered; the page's members are still compared.
     """
-    if _tool_of(name) == 'documents' and isinstance(value, dict) and value.get('sorted') is False:
+    if _tool_of(name) == 'list_documents' and isinstance(value, dict) and value.get('sorted') is False:
         items = value.get('items')
         if isinstance(items, list) and all(isinstance(i, dict) for i in items):
             return {**value, 'items': sorted(items, key=lambda i: (str(i.get('objectId')), str(i.get('path'))))}

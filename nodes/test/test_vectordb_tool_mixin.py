@@ -18,10 +18,11 @@ so no server or database is needed. They cover:
   populates ``question.embedding``; when absent returns an error envelope.
 * Auto-embed on upsert — mixin computes embeddings via IGlobal.embed_query
   and sets both Doc.embedding and Doc.embedding_model before addChunks.
-* The Vector Explorer tools (``dialect``, ``stats``, ``documents``, ``chunks``,
-  ``vectors``, ``sample``, ``project``, ``neighbors``, ``remove_document``) and
-  the additive answers of the legacy tools, over the in-memory drivers of
-  ``test_vector_hooks``: each tool's success answer and every code it can return.
+* The Vector Explorer tools (``dialect``, ``stats``, ``list_documents``, ``chunks``,
+  ``vectors``, ``sample``, ``project``, ``neighbors``, ``delete``; the trash tools have
+  their own suite, ``test_vector_tool_set``) and the additive answers of the legacy
+  tools, over the in-memory drivers of ``test_vector_hooks``: each tool's success answer
+  and every code it can return.
 
 Write tools run the gate, which reads the engine's call context; tests set it
 with the ``context`` fixture (``agent()`` / ``dap()``).
@@ -248,8 +249,8 @@ def test_normalize_non_dict_json_returns_empty() -> None:
 # ---------------------------------------------------------------------------
 
 # Expected bare tool names from VectorStoreToolMixin
-_LEGACY_TOOLS = {'search', 'upsert', 'delete', 'objdir', 'stats', 'get'}
-_EXPLORER_TOOLS = {'dialect', 'documents', 'chunks', 'vectors', 'sample', 'project', 'neighbors', 'remove_document'}
+_LEGACY_TOOLS = {'search', 'upsert', 'delete', 'objdir', 'stats', 'get', 'list_documents', 'soft_delete', 'restore'}
+_EXPLORER_TOOLS = {'dialect', 'chunks', 'vectors', 'sample', 'project', 'neighbors'}
 _EXPECTED_TOOLS = _LEGACY_TOOLS | _EXPLORER_TOOLS
 # The additive tools of the extension contract (recommend and similarity_matrix). A node
 # lists them once ``VectorExplorerExtTools`` defines them, and never lists any other tool.
@@ -831,7 +832,7 @@ def test_dialect_describes_the_store():
         8,
     )
     assert answer['score'] == {'formula': 'unknown', 'higher_is_better': True, 'floor': 0.2, 'threshold': 0.3}
-    assert answer['write_tools'] == ['remove_document', 'delete', 'upsert']
+    assert answer['write_tools'] == ['upsert', 'delete', 'soft_delete', 'restore']
     assert answer['writes_scope'] == 'tools_source'
     assert answer['health'] == {
         'collection_exists': True,
@@ -847,11 +848,12 @@ def test_dialect_capabilities_follow_the_driver():
     assert caps['count_documents'] and caps['vectors'] and caps['sample'] and caps['sample_light']
     assert caps['sample_stratified_native'] and caps['documents_distinct'] and caps['documents_sorted']
     assert caps['search_keyword'] and caps['remove_count'] and caps['project'] and caps['neighbors']
-    assert caps['knn_native'] is False and caps['soft_delete'] is False and caps['search_vector'] is True
+    assert caps['knn_native'] is False and caps['soft_delete'] is True and caps['search_vector'] is True
     assert caps['projection'] == ['pca']
     bare = node(MemoryStore().seed(corpus({'a': [0]}))).dialect({})['capabilities']
     assert bare['vectors'] is False and bare['sample'] is False and bare['count_documents'] is False
     assert bare['documents'] is True and bare['chunks'] is True and bare['remove_count'] is False
+    assert bare['soft_delete'] is True, 'every driver implements markDeleted and markActive'
 
 
 def test_dialect_reports_the_write_switches():
@@ -1159,7 +1161,7 @@ def test_stats_store_failure_is_a_store_error():
 
 
 def test_documents_lists_rows_with_paths_and_counts():
-    answer = node(clustered(docs=3, chunks=2)).documents({})
+    answer = node(clustered(docs=3, chunks=2)).list_documents({})
     assert answer['success'] is True
     assert [row['objectId'] for row in answer['items']] == ['doc00', 'doc01', 'doc02']
     first = answer['items'][0]
@@ -1218,7 +1220,7 @@ def _with_health(store: Any, health: Dict[str, tuple]) -> Any:
 def test_documents_items_carry_the_health_fields_the_driver_reports():
     """``max_chunk_id`` and ``deleted_chunks`` come from the driver's row, null where it has none."""
     store = _with_health(clustered(docs=3, chunks=2), {'doc00': (4, 1), 'doc02': (1, 0)})
-    items = {item['objectId']: item for item in node(store).documents({})['items']}
+    items = {item['objectId']: item for item in node(store).list_documents({})['items']}
     assert (items['doc00']['max_chunk_id'], items['doc00']['deleted_chunks']) == (4, 1)
     assert (items['doc01']['max_chunk_id'], items['doc01']['deleted_chunks']) == (None, None)
     assert (items['doc02']['max_chunk_id'], items['doc02']['deleted_chunks']) == (1, 0)
@@ -1238,35 +1240,35 @@ def test_documents_items_carry_the_health_fields_the_driver_reports():
 def test_documents_health_fields_are_whole_numbers_or_null(reported, answered):
     """A health figure that is not a whole number of 0 or more is answered null, never rounded."""
     store = _with_health(clustered(docs=1, chunks=2), {'doc00': reported})
-    item = node(store).documents({})['items'][0]
+    item = node(store).list_documents({})['items'][0]
     assert (item['max_chunk_id'], item['deleted_chunks']) == answered
 
 
 def test_documents_pages_with_the_cursor():
     inst = node(clustered(docs=5, chunks=1))
-    first = inst.documents({'limit': 2})
-    second = inst.documents({'limit': 2, 'cursor': first['next_cursor']})
+    first = inst.list_documents({'limit': 2})
+    second = inst.list_documents({'limit': 2, 'cursor': first['next_cursor']})
     # sorted by path: folder0 holds doc00 and doc03, folder1 doc01 and doc04
     assert [r['objectId'] for r in first['items'] + second['items']] == ['doc00', 'doc03', 'doc01', 'doc04']
 
 
 def test_documents_default_listing_is_marked_unsorted():
-    answer = node(MemoryStore().seed(corpus({'b': [0], 'a': [0]}))).documents({})
+    answer = node(MemoryStore().seed(corpus({'b': [0], 'a': [0]}))).list_documents({})
     assert answer['sorted'] is False and 'documents_unsorted' in answer['caveats']
     assert all(row['chunks'] is None for row in answer['items'])
 
 
 def test_documents_on_an_offset_ignoring_store_ends_with_the_paging_caveat():
     inst = node(MemoryStore(ignore_offset=True).seed(corpus({f'd{i}': [0] for i in range(4)})))
-    first = inst.documents({'limit': 2})
-    second = inst.documents({'limit': 2, 'cursor': first['next_cursor']})
+    first = inst.list_documents({'limit': 2})
+    second = inst.list_documents({'limit': 2, 'cursor': first['next_cursor']})
     assert second['items'] == [] and second['next_cursor'] is None
     assert 'documents_paging_unsupported' in second['caveats']
 
 
 def test_documents_clamps_the_limit_with_a_warning():
     store = clustered(docs=2, chunks=1)
-    answer = node(store).documents({'limit': 10_000})
+    answer = node(store).list_documents({'limit': 10_000})
     assert answer['warnings'] == ['limit_clamped']
     assert [c for c in store.calls if c[0] == 'listDocumentPage'][-1][2] == 500
 
@@ -1284,14 +1286,14 @@ def test_documents_clamps_the_limit_with_a_warning():
     ],
 )
 def test_documents_rejects_bad_input(args):
-    answer = node(clustered()).documents(args)
+    answer = node(clustered()).list_documents(args)
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
 
 
 @pytest.mark.parametrize('state', FORGED_CURSORS, ids=[str(s) for s in FORGED_CURSORS])
 @pytest.mark.parametrize('store_cls', [MemoryStore, ExactListingStore], ids=['default', 'native'])
 def test_documents_refuses_a_forged_cursor_as_invalid_input(state, store_cls):
-    answer = node(store_cls().seed(corpus({'a': [0], 'b': [0]}))).documents(
+    answer = node(store_cls().seed(corpus({'a': [0], 'b': [0]}))).list_documents(
         {'cursor': _store_module.encodeCursor(state)}
     )
     assert answer == {
@@ -1302,7 +1304,7 @@ def test_documents_refuses_a_forged_cursor_as_invalid_input(state, store_cls):
 
 
 def test_documents_never_lists_the_control_record():
-    answer = node(MemoryStore().seed(corpus({'a': [0]}))).documents({'deleted': 'all'})
+    answer = node(MemoryStore().seed(corpus({'a': [0]}))).list_documents({'deleted': 'all'})
     assert 'schema' not in [row['objectId'] for row in answer['items']]
 
 
@@ -1311,7 +1313,7 @@ def test_documents_unsupported_listing_is_unsupported():
         def listDocumentPage(self, **kw):
             raise StoreUnsupported('listDocumentPage is not supported by this store')
 
-    answer = node(NoListing().seed(corpus({'a': [0]}))).documents({})
+    answer = node(NoListing().seed(corpus({'a': [0]}))).list_documents({})
     assert (answer['success'], answer['code']) == (False, 'UNSUPPORTED')
 
 
@@ -2212,20 +2214,19 @@ def test_search_never_returns_the_control_record():
 
 
 # ---------------------------------------------------------------------------
-# remove_document
+# delete: the only permanent removal
 # ---------------------------------------------------------------------------
 
 
-def test_remove_document_removes_and_reports_rows(context):
+def test_delete_removes_and_reports_rows(context):
     context(dap())
     store = clustered(CountingStore, docs=3, chunks=4)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc01', 'ghost']})
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc01', 'ghost']})
     assert answer['success'] is True
-    assert answer['removed'] == [{'objectId': 'doc01', 'chunks_removed': 4}]
-    assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] == 4
+    assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] == 4 and answer['kept_live'] == []
     assert not any(key[0] == 'doc01' for key in store.rows)
     assert answer['audit'] == {
-        'action': 'vector.remove_document',
+        'action': 'vector.delete',
         'node': 'store_1',
         'provider': 'postgres',
         'collection': 'vx_test_docs',
@@ -2235,24 +2236,23 @@ def test_remove_document_removes_and_reports_rows(context):
     }
 
 
-def test_remove_document_audit_carries_no_content(context):
+def test_delete_audit_carries_no_content(context):
     context(dap())
-    answer = node(clustered(CountingStore), allow_writes=True).remove_document({'object_ids': ['doc00']})
+    answer = node(clustered(CountingStore), allow_writes=True).delete({'object_ids': ['doc00']})
     text = json.dumps(answer['audit'])
     assert 'lorem' not in text and 'chunk' not in text and 'embedding' not in text
     assert set(answer['audit']) == {'action', 'node', 'provider', 'collection', 'object_ids', 'rows', 'caller'}
 
 
-def test_remove_document_without_counts_reports_unknown_rows(context):
+def test_delete_without_counts_reports_unknown_rows(context):
     context(dap())
     store = MemoryStore().seed(corpus({'a': [0, 1], 'b': [0]}))
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['a', 'b']})
-    assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': None}, {'objectId': 'b', 'chunks_removed': None}]
+    answer = node(store, allow_writes=True).delete({'object_ids': ['a', 'b']})
     assert answer['removed_chunks'] is None and answer['not_found'] == []
     assert not any(key[0] in ('a', 'b') for key in store.rows)
 
 
-def test_remove_document_single_document_takes_the_driver_count(context):
+def test_delete_of_a_single_document_takes_the_driver_count(context):
     context(dap())
 
     class Returning(MemoryStore):
@@ -2260,8 +2260,8 @@ def test_remove_document_single_document_takes_the_driver_count(context):
             self.remove(objectIds)
             return 2
 
-    answer = node(Returning().seed(corpus({'a': [0, 1]})), allow_writes=True).remove_document({'object_ids': ['a']})
-    assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': 2}] and answer['removed_chunks'] == 2
+    answer = node(Returning().seed(corpus({'a': [0, 1]})), allow_writes=True).delete({'object_ids': ['a']})
+    assert answer['removed_chunks'] == 2 and answer['not_found'] == []
 
 
 class _NativeRemovalStore(CountingStore):
@@ -2278,38 +2278,35 @@ def _backend_calls(store, *names):
     return [call for call in store.calls if call[0] in names]
 
 
-def test_remove_document_counts_each_document_once(context):
+def test_delete_counts_each_document_once(context):
     context(dap())
     store = clustered(CountingStore, docs=4, chunks=2)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc00', 'doc01', 'ghost']})
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc00', 'doc01', 'ghost']})
     assert answer['removed_chunks'] == 4 and answer['not_found'] == ['ghost']
     assert len(_backend_calls(store, 'countChunks')) == 3
     assert _backend_calls(store, 'remove') == [('remove', ['doc00', 'doc01'])]
 
 
-def test_remove_document_of_one_document_asks_a_counting_driver_once(context):
+def test_delete_of_one_document_asks_a_counting_driver_once(context):
     context(dap())
     store = clustered(_NativeRemovalStore, docs=2, chunks=3)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc01']})
-    assert answer['removed'] == [{'objectId': 'doc01', 'chunks_removed': 3}] and answer['removed_chunks'] == 3
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc01']})
+    assert answer['removed_chunks'] == 3 and not any(key[0] == 'doc01' for key in store.rows)
     assert _backend_calls(store, 'countChunks', 'removeCounted') == [('removeCounted', ['doc01'])]
 
 
-def test_remove_document_of_one_missing_document_on_a_counting_driver(context):
+def test_delete_of_one_missing_document_on_a_counting_driver(context):
     context(dap())
     store = clustered(_NativeRemovalStore, docs=2, chunks=3)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
-    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+    answer = node(store, allow_writes=True).delete({'object_ids': ['ghost']})
+    assert (answer['not_found'], answer['removed_chunks']) == (['ghost'], 0)
 
 
-def test_remove_document_of_several_documents_on_a_counting_driver(context):
+def test_delete_of_several_documents_on_a_counting_driver(context):
     context(dap())
     store = clustered(_NativeRemovalStore, docs=3, chunks=2)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc00', 'ghost', 'doc02']})
-    assert answer['removed'] == [
-        {'objectId': 'doc00', 'chunks_removed': 2},
-        {'objectId': 'doc02', 'chunks_removed': 2},
-    ]
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc00', 'ghost', 'doc02']})
+    assert sorted({key[0] for key in store.rows if key[0] != 'schema'}) == ['doc01']
     assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] == 4
     assert _backend_calls(store, 'removeCounted') == [('removeCounted', ['doc00', 'doc02'])]
 
@@ -2332,29 +2329,27 @@ class _UncountedEverythingStore(MemoryStore):
         return None
 
 
-def test_remove_document_of_an_unknown_id_when_the_driver_cannot_count_removals(context):
+def test_delete_of_an_unknown_id_when_the_driver_cannot_count_removals(context):
     context(dap())
     store = clustered(_UncountedRemovalStore, docs=2, chunks=3)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
-    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+    answer = node(store, allow_writes=True).delete({'object_ids': ['ghost']})
+    assert (answer['not_found'], answer['removed_chunks']) == (['ghost'], 0)
     assert not _backend_calls(store, 'removeCounted')
 
 
-def test_remove_document_of_a_stored_id_when_the_driver_cannot_count_removals(context):
+def test_delete_of_a_stored_id_when_the_driver_cannot_count_removals(context):
     context(dap())
     store = clustered(_UncountedRemovalStore, docs=2, chunks=3)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc01']})
-    assert answer['removed'] == [{'objectId': 'doc01', 'chunks_removed': None}]
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc01']})
     assert answer['not_found'] == [] and answer['removed_chunks'] is None
     assert not any(key[0] == 'doc01' for key in store.rows)
 
 
 @pytest.mark.parametrize('store_cls', [_UncountedEverythingStore, MemoryStore])
-def test_remove_document_without_any_count_still_finds_unknown_ids(context, store_cls):
+def test_delete_without_any_count_still_finds_unknown_ids(context, store_cls):
     context(dap())
     store = store_cls().seed(corpus({'a': [0, 1], 'b': [3]}))
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['a', 'ghost', 'b']})
-    assert answer['removed'] == [{'objectId': 'a', 'chunks_removed': None}, {'objectId': 'b', 'chunks_removed': None}]
+    answer = node(store, allow_writes=True).delete({'object_ids': ['a', 'ghost', 'b']})
     assert answer['not_found'] == ['ghost'] and answer['removed_chunks'] is None
     assert not any(key[0] in ('a', 'b') for key in store.rows)
 
@@ -2390,35 +2385,35 @@ def _stored(store, object_id):
 
 @pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
 @pytest.mark.parametrize('object_id', ['a', 'gone'])
-def test_remove_document_removes_a_stored_document_whatever_the_legacy_flag_selects(context, store_cls, object_id):
+def test_delete_removes_any_stored_document_whatever_the_legacy_flag_selects(context, store_cls, object_id):
     context(dap())
     store = _removal_corpus(store_cls)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': [object_id]})
-    assert answer['not_found'] == [] and [row['objectId'] for row in answer['removed']] == [object_id]
+    answer = node(store, allow_writes=True).delete({'object_ids': [object_id]})
+    assert answer['not_found'] == []
     assert answer['removed_chunks'] in (2, None) and answer['audit']['rows'] == answer['removed_chunks']
     assert not _stored(store, object_id) and _stored(store, 'b')
 
 
 @pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
-def test_remove_document_tells_stored_documents_from_unknown_ids_whatever_the_legacy_flag_selects(context, store_cls):
+def test_delete_tells_stored_documents_from_unknown_ids_whatever_the_legacy_flag_selects(context, store_cls):
     context(dap())
     store = _removal_corpus(store_cls)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['a', 'ghost', 'gone']})
-    assert [row['objectId'] for row in answer['removed']] == ['a', 'gone'] and answer['not_found'] == ['ghost']
+    answer = node(store, allow_writes=True).delete({'object_ids': ['a', 'ghost', 'gone']})
+    assert answer['not_found'] == ['ghost']
     assert not _stored(store, 'a') and not _stored(store, 'gone') and _stored(store, 'b')
 
 
 @pytest.mark.parametrize('store_cls', _REMOVAL_DRIVERS, ids=lambda cls: cls.__name__)
-def test_remove_document_of_an_unknown_id_removes_nothing_whatever_the_legacy_flag_selects(context, store_cls):
+def test_delete_of_an_unknown_id_removes_nothing_whatever_the_legacy_flag_selects(context, store_cls):
     context(dap())
     store = _removal_corpus(store_cls)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['ghost']})
-    assert (answer['removed'], answer['not_found'], answer['removed_chunks']) == ([], ['ghost'], 0)
+    answer = node(store, allow_writes=True).delete({'object_ids': ['ghost']})
+    assert (answer['not_found'], answer['removed_chunks']) == (['ghost'], 0)
     assert not _backend_calls(store, 'remove', 'removeCounted')
 
 
 @pytest.mark.parametrize('store_cls', DELETED_READINGS)
-def test_delete_removes_a_stored_document_whatever_the_legacy_flag_selects(context, store_cls):
+def test_delete_removes_a_live_document_whatever_the_legacy_flag_selects(context, store_cls):
     context(dap())
     store = _removal_corpus(store_cls)
     answer = node(store, allow_writes=True).delete({'object_ids': ['a', 'ghost']})
@@ -2427,27 +2422,28 @@ def test_delete_removes_a_stored_document_whatever_the_legacy_flag_selects(conte
 
 
 @pytest.mark.parametrize('store_cls', DELETED_READINGS)
-def test_remove_document_confirms_an_active_document_with_one_one_row_read(context, store_cls):
+def test_delete_confirms_an_active_document_with_one_one_row_read(context, store_cls):
     context(dap())
     store = _removal_corpus(store_cls)
-    node(store, allow_writes=True).remove_document({'object_ids': ['a']})
+    node(store, allow_writes=True).delete({'object_ids': ['a']})
     reads = [call[1] for call in _backend_calls(store, 'get')]
     assert len(reads) == 1 and (reads[0].objectIds, reads[0].limit, reads[0].deleted) == (['a'], 1, 'active')
 
 
 @pytest.mark.parametrize('store_cls', DELETED_READINGS)
-def test_documents_and_chunks_read_active_documents_whatever_the_legacy_flag_selects(store_cls):
+def test_list_documents_and_chunks_read_active_documents_whatever_the_legacy_flag_selects(store_cls):
     inst = node(_removal_corpus(store_cls))
-    assert [row['objectId'] for row in inst.documents({})['items']] == ['a', 'b']
+    assert [row['objectId'] for row in inst.list_documents({})['items']] == ['a', 'b']
     assert [item['chunkId'] for item in inst.chunks({'object_id': 'a'})['items']] == [0, 1]
-    assert inst.chunks({'object_id': 'gone'})['code'] == 'NOT_FOUND'
+    assert inst.chunks({'object_id': 'gone'})['code'] == 'IN_TRASH'
+    assert inst.chunks({'object_id': 'ghost'})['code'] == 'NOT_FOUND'
 
 
-def test_remove_document_reserved_id(context):
+def test_delete_reserved_id(context):
     context(dap())
     store = clustered(CountingStore)
     before = dict(store.rows)
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['schema']})
+    answer = node(store, allow_writes=True).delete({'object_ids': ['schema']})
     assert (answer['success'], answer['code']) == (False, 'RESERVED_ID')
     assert store.rows.keys() == before.keys()
 
@@ -2466,7 +2462,7 @@ def test_remove_document_reserved_id(context):
         (agent(), {'allow_writes': True, 'allow_write': False}, None),
     ],
 )
-@pytest.mark.parametrize('tool', ['remove_document', 'delete'])
+@pytest.mark.parametrize('tool', ['delete', 'soft_delete'])
 def test_refused_removals_leave_the_data_unchanged(context, ctx, switches, code, tool):
     context(ctx)
     store = clustered(CountingStore, docs=2, chunks=2)
@@ -2499,9 +2495,9 @@ def test_refused_upserts_leave_the_data_unchanged(context, ctx, switches, code):
 
 
 _UNCHECKED_INPUT = {
-    ('remove_document', 'malformed'): {'object_ids': 'doc00'},
-    ('remove_document', 'too_many'): {'object_ids': [f'd{i}' for i in range(101)]},
-    ('remove_document', 'missing'): {},
+    ('soft_delete', 'malformed'): {'object_ids': 'doc00'},
+    ('soft_delete', 'too_many'): {'object_ids': [f'd{i}' for i in range(101)]},
+    ('soft_delete', 'missing'): {},
     ('delete', 'malformed'): {'object_ids': []},
     ('delete', 'too_many'): {'object_ids': [f'd{i}' for i in range(101)]},
     ('delete', 'missing'): {},
@@ -2527,7 +2523,7 @@ def test_the_gate_answers_before_the_input_is_checked(context, ctx, switches, co
     assert (answer['success'], answer.get('code')) == (False, code)
 
 
-@pytest.mark.parametrize('tool', ['remove_document', 'delete'])
+@pytest.mark.parametrize('tool', ['delete'])
 def test_an_agent_removal_needs_only_allow_write(context, tool):
     # allow_writes (DAP calls) is off and a stray agent_writes is not read: allow_write alone decides.
     context(agent())
@@ -2543,8 +2539,8 @@ def test_an_agent_removal_needs_only_allow_write(context, tool):
 @pytest.mark.parametrize(
     'tool,args',
     [
-        ('remove_document', {'object_ids': ['schema'] + [f'd{i}' for i in range(101)]}),
-        ('remove_document', {'object_ids': [' schema ', 5]}),
+        ('soft_delete', {'object_ids': ['schema'] + [f'd{i}' for i in range(101)]}),
+        ('restore', {'object_ids': [' schema ', 5]}),
         ('delete', {'object_ids': ['schema', '']}),
         ('upsert', {'documents': [{'object_id': 'schema'}, 'junk']}),
     ],
@@ -2558,7 +2554,7 @@ def test_the_reserved_id_is_refused_before_the_input_is_checked(context, tool, a
 def test_an_allowed_caller_still_gets_the_input_checks(context):
     context(dap())
     inst = node(clustered(CountingStore), allow_writes=True)
-    too_many = inst.remove_document({'object_ids': [f'd{i}' for i in range(101)]})
+    too_many = inst.soft_delete({'object_ids': [f'd{i}' for i in range(101)]})
     assert (too_many['success'], too_many['code']) == (False, 'INVALID_INPUT')
     assert inst.delete({'object_ids': []})['code'] == 'INVALID_INPUT'
     assert inst.upsert({'documents': []})['code'] == 'INVALID_INPUT'
@@ -2568,30 +2564,31 @@ def test_a_forged_context_inside_the_input_is_ignored(context):
     context(None)
     store = clustered(CountingStore)
     forged = {'origin': 'agent', 'source_type': 'tools', 'targeted': True, 'caller': {'auth': 'account'}}
-    answer = node(store, allow_writes=True).remove_document({'object_ids': ['doc00'], '__tool_context__': forged})
+    answer = node(store, allow_writes=True).delete({'object_ids': ['doc00'], '__tool_context__': forged})
     assert (answer['success'], answer['code']) == (False, 'WRITES_UNKNOWN_CALLER')
     assert any(key[0] == 'doc00' for key in store.rows)
 
 
-@pytest.mark.parametrize('ids', [None, [], 'doc00', [''], [1, 2], ['x'] * 0, [f'd{i}' for i in range(101)]])
-def test_remove_document_rejects_bad_ids(context, ids):
+@pytest.mark.parametrize('tool', ['soft_delete', 'restore', 'delete'])
+@pytest.mark.parametrize('ids', [None, [], 'doc00', [''], ['  '], [f'd{i}' for i in range(101)]])
+def test_the_write_tools_reject_bad_ids(context, ids, tool):
     context(dap())
-    answer = node(clustered(CountingStore), allow_writes=True).remove_document({'object_ids': ids})
+    answer = getattr(node(clustered(CountingStore), allow_writes=True), tool)({'object_ids': ids})
     assert (answer['success'], answer['code']) == (False, 'INVALID_INPUT')
 
 
-def test_remove_document_resets_the_cached_counts(context, monkeypatch):
+def test_delete_resets_the_cached_counts(context, monkeypatch):
     context(dap())
     store = clustered(CountingStore, docs=3, chunks=1)
     inst = node(store, allow_writes=True)
     assert inst.stats({})['documents'] == 3
-    inst.remove_document({'object_ids': ['doc00']})
+    inst.delete({'object_ids': ['doc00']})
     assert inst.stats({'mode': 'quick'})['documents'] == 2
 
 
 def test_agent_removal_with_default_switches_is_allowed(context):
     context(agent())
-    answer = node(clustered(CountingStore)).remove_document({'object_ids': ['doc00']})
+    answer = node(clustered(CountingStore)).delete({'object_ids': ['doc00']})
     assert answer['success'] is True
     assert answer['audit']['caller'] == {'auth': 'agent', 'userId': None, 'teamId': None}
 
