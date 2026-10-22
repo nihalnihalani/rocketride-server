@@ -66,6 +66,7 @@ from ..schema import Doc, DocFilter, QuestionText
 from . import vx_write_gate
 from .errors import StoreError, StoreUnsupported, ToolRefusal
 from .vx_defaults import (
+    AGENT_WRITE_IDS_MAX,
     VECTOR_ALLOW_WRITES_DEFAULT,
     VECTOR_TOOL_DEFAULTS,
     VECTOR_TOOL_LIMITS,
@@ -2666,15 +2667,56 @@ class VectorExplorerTools:
 
     @staticmethod
     def _vx_write_ids(tool: str, raw: Any, decision: Any) -> List[str]:
-        """The distinct, stripped ids of a write call, in request order; non-agent callers send at most ``write_ids_max``."""
+        """The distinct, stripped ids of a write call, in request order.
+
+        Callers other than agents send at most ``write_ids_max``, agents at most
+        ``AGENT_WRITE_IDS_MAX``.
+        """
         if not isinstance(raw, list) or not raw:
             raise _invalid(f'{tool} requires a non-empty "object_ids" array')
         clean = [str(oid).strip() for oid in raw if str(oid).strip()]
         if not clean:
             raise _invalid(f'{tool}: no valid object IDs provided')
-        if decision.origin != 'agent' and len(clean) > LIMITS['write_ids_max']:
-            raise _invalid(f'object_ids must be a list of 1 to {LIMITS["write_ids_max"]} strings.')
+        cap = AGENT_WRITE_IDS_MAX if decision.origin == 'agent' else LIMITS['write_ids_max']
+        if len(clean) > cap:
+            raise _invalid(f'object_ids must be a list of 1 to {cap} strings.')
         return list(dict.fromkeys(clean))
+
+    def _vx_unstored(self, store: Any, ids: Sequence[str]) -> List[str]:
+        """The ids among ``ids`` with no chunk stored, in order.
+
+        One count of the stored documents answers for the whole list when it finds all of
+        them or none; otherwise each id is counted (a one-row read decides where the store
+        cannot count, for up to ``write_ids_max`` ids).
+        """
+        stored = self._vx_count(store.countDocumentsWhere, deletedFilter('all', objectIds=list(ids)))
+        if stored is None:
+            stored = 0 if self._vx_count(store.countChunks, deletedFilter('all', objectIds=list(ids))) == 0 else None
+        if stored == len(ids):
+            return []
+        if stored == 0:
+            return list(ids)
+        per = {oid: self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid])) for oid in ids}
+        if len(ids) <= LIMITS['write_ids_max']:
+            for oid in ids:
+                if per[oid] is None and not self._vx_document_stored(store, oid):
+                    per[oid] = 0
+        return [oid for oid in ids if per[oid] == 0]
+
+    def _vx_with_live_chunk(self, store: Any, ids: Sequence[str]) -> List[str]:
+        """The ids among ``ids`` that have a chunk out of the trash, in order (``delete {deleted_only}`` keeps them).
+
+        One count answers for the whole list when none of them or all of them has one;
+        otherwise each id is checked.
+        """
+        live = self._vx_count(store.countDocumentsWhere, deletedFilter('active', objectIds=list(ids)))
+        if live is None:
+            live = 0 if self._vx_count(store.countChunks, deletedFilter('active', objectIds=list(ids))) == 0 else None
+        if live == 0:
+            return []
+        if live == len(ids):
+            return list(ids)
+        return [oid for oid in ids if self._vx_has_live_chunk(store, oid)]
 
     def _vx_trash_write(self, tool: str, args: Mapping[str, Any], *, deleted: bool) -> Dict[str, Any]:
         """The body of ``soft_delete`` (``deleted``) and ``restore``: the gate, the ids, one driver call.
@@ -2690,13 +2732,8 @@ class VectorExplorerTools:
             tool, object_ids=_gate_ids(args.get('object_ids')), allow_writes=self._vx_allow_writes()
         )
         ids = self._vx_write_ids(tool, args.get('object_ids'), decision)
-        per = {oid: self._vx_count(store.countChunks, deletedFilter('all', objectIds=[oid])) for oid in ids}
-        if len(ids) <= LIMITS['write_ids_max']:
-            for oid in ids:
-                if per[oid] is None and not self._vx_document_stored(store, oid):
-                    per[oid] = 0
-        not_found = [oid for oid in ids if per[oid] == 0]
-        targets = [oid for oid in ids if per[oid] != 0]
+        not_found = self._vx_unstored(store, ids)
+        targets = [oid for oid in ids if oid not in not_found]
         matched: Optional[int] = 0
         if targets:
             matched = _int_or_none(store.markDeleted(targets) if deleted else store.markActive(targets))

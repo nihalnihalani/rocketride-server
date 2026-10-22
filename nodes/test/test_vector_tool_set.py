@@ -265,6 +265,88 @@ def test_delete_refuses_a_deleted_only_that_is_not_a_boolean(context):
 
 
 # ---------------------------------------------------------------------------
+# What a trash write costs (contract section 4.5)
+# ---------------------------------------------------------------------------
+
+#: The most object_ids an agent sends soft_delete, restore or delete {deleted_only} in one call.
+AGENT_IDS_MAX = 1000
+
+
+def _count_calls(store, deleted=None):
+    """The filtered counts the store was asked for (of one ``deleted`` selection when given)."""
+    return [
+        call
+        for call in store.calls
+        if call[0] in ('countChunks', 'countDocumentsWhere') and (deleted is None or call[1].deleted == deleted)
+    ]
+
+
+def test_the_agent_cap_is_a_documented_constant():
+    from ai.common.store import vx_defaults
+
+    assert getattr(vx_defaults, 'AGENT_WRITE_IDS_MAX', None) == AGENT_IDS_MAX
+    assert 'AGENT_WRITE_IDS_MAX' not in VECTOR_TOOL_LIMITS, 'not a dialect limit: the app writes as a DAP caller'
+
+
+@pytest.mark.parametrize('tool', ['soft_delete', 'restore', 'empty_trash'])
+def test_an_agent_sends_at_most_a_thousand_ids_per_trash_write(context, tool):
+    context(agent())
+    store = clustered(CountingStore, docs=2, chunks=2)
+    store.markDeleted(['doc01'])
+    before = _rows(store)
+    inst = node(store)
+    ids = ['doc00', 'doc01'] + [f'ghost{n:04d}' for n in range(AGENT_IDS_MAX - 1)]
+    call = (lambda args: inst.delete({**args, 'deleted_only': True})) if tool == 'empty_trash' else getattr(inst, tool)
+    store.calls.clear()
+    refused = call({'object_ids': ids})
+    assert (refused['success'], refused.get('code')) == (False, 'INVALID_INPUT'), refused
+    assert f'1 to {AGENT_IDS_MAX} strings' in refused['error'], refused
+    assert _rows(store) == before and _count_calls(store) == [], 'refused before anything is read'
+    assert call({'object_ids': ids[:AGENT_IDS_MAX]})['success'] is True
+
+
+def test_an_agent_s_plain_delete_keeps_develop_s_open_list(context):
+    context(agent())
+    store = clustered(CountingStore, docs=2, chunks=2)
+    ids = ['doc00'] + [f'ghost{n:04d}' for n in range(AGENT_IDS_MAX)]
+    answer = node(store).delete({'object_ids': ids})
+    assert answer['success'] is True and answer['removed_chunks'] == 2, answer
+
+
+@pytest.mark.parametrize('tool', ['soft_delete', 'restore'])
+def test_a_trash_write_of_stored_documents_counts_them_once(context, tool):
+    context(agent())
+    store = clustered(CountingStore, docs=300, chunks=2)
+    if tool == 'restore':
+        store.markDeleted([key[0] for key in _rows(store)])
+    ids = sorted({key[0] for key in _rows(store)})
+    store.calls.clear()
+    answer = getattr(node(store), tool)({'object_ids': ids})
+    assert (answer['success'], answer['matched_chunks'], answer['not_found']) == (True, 600, []), answer
+    assert len(_count_calls(store)) == 1, _count_calls(store)
+
+
+def test_a_trash_write_still_names_the_unknown_ids(context):
+    context(agent())
+    store = clustered(CountingStore, docs=150, chunks=1)
+    ids = sorted({key[0] for key in _rows(store)}) + ['ghost-a', 'ghost-b']
+    answer = node(store).soft_delete({'object_ids': ids})
+    assert (answer['success'], answer['matched_chunks'], answer['not_found']) == (True, 150, ['ghost-a', 'ghost-b'])
+
+
+def test_emptying_a_trash_of_wholly_trashed_documents_checks_them_once(context):
+    context(dap())
+    store = clustered(CountingStore, docs=100, chunks=2)
+    ids = sorted({key[0] for key in _rows(store)})
+    store.markDeleted(ids)
+    store.calls.clear()
+    answer = node(store, allow_writes=True).delete({'object_ids': ids, 'deleted_only': True})
+    assert (answer['success'], answer['kept_live'], answer['removed_chunks']) == (True, [], 200), answer
+    assert len(_count_calls(store, 'active')) == 1, 'one live check for the whole list'
+    assert _rows(store) == {}
+
+
+# ---------------------------------------------------------------------------
 # stats, get, chunks and dialect
 # ---------------------------------------------------------------------------
 

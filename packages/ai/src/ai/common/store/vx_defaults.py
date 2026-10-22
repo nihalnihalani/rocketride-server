@@ -41,6 +41,12 @@ This module must stay free of imports: the generator loads it by path.
 #: Off by default; turn it on per store node with ``allow_writes``.
 VECTOR_ALLOW_WRITES_DEFAULT = False
 
+#: The most object_ids an agent may send ``soft_delete``, ``restore`` or ``delete`` with
+#: ``deleted_only`` in one call (each id may cost the store a count). Callers other than
+#: agents send at most ``write_ids_max``; an agent's plain ``delete`` keeps develop's open
+#: list. Not a ``dialect`` limit: the explorer writes as a DAP caller (contract section 4.5).
+AGENT_WRITE_IDS_MAX = 1000
+
 #: Node-enforced limits, reported verbatim in ``dialect.limits`` (contract section 4.1).
 #: Page sizes and counts are maxima; the ``*_default`` keys are the defaults.
 #: ``statement_timeout_ms`` applies to pgvector; other drivers report None.

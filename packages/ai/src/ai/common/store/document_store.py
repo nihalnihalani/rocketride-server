@@ -8,7 +8,7 @@ from rocketlib import IInstanceBase, tool_function, warning
 from ..schema import Doc, DocFilter, DocMetadata, Question, QuestionText, QuestionType, Answer
 from . import vx_write_gate
 from .errors import StoreUnsupported, ToolRefusal
-from .vx_defaults import VECTOR_TOOL_LIMITS
+from .vx_defaults import AGENT_WRITE_IDS_MAX, VECTOR_TOOL_LIMITS
 from .vx_tools import (  # noqa: F401 - re-exported for the drivers that override the hooks
     ListingGuard,
     VectorExplorerTools,
@@ -1956,8 +1956,11 @@ class VectorStoreToolMixin(VectorExplorerExtTools, VectorExplorerTools):
             deleted_only = False
         if not isinstance(deleted_only, bool):
             raise ToolRefusal('INVALID_INPUT', 'deleted_only must be true or false.')
+        if deleted_only and decision.origin == 'agent' and len(clean_ids) > AGENT_WRITE_IDS_MAX:
+            # Each id may cost a live check; an agent's plain delete keeps develop's open list.
+            raise ToolRefusal('INVALID_INPUT', f'object_ids must be a list of 1 to {AGENT_WRITE_IDS_MAX} strings.')
         unique_ids = list(dict.fromkeys(clean_ids))
-        kept_live = [oid for oid in unique_ids if self._vx_has_live_chunk(store, oid)] if deleted_only else []
+        kept_live = self._vx_with_live_chunk(store, unique_ids) if deleted_only else []
         targets = [oid for oid in unique_ids if oid not in kept_live]
         not_found: List[str] = []
         rows: Optional[int] = 0
