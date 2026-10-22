@@ -32,6 +32,9 @@ The configured tool server name is the namespace for the functions below; it def
 | `search` | Search the collection for matching documents. |
 | `upsert` | Add or update documents in the collection. |
 | `delete` | Remove documents by object ID. |
+| `list_documents` | List the documents one by one with their path and chunk count, in pages ordered by path (follow `next_cursor`); `deleted: 'deleted'` lists the trash. |
+| `soft_delete` | Move documents to the trash by object ID: their chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. |
+| `restore` | Take documents out of the trash by object ID. |
 
 `search` and an `upsert` without a supplied embedding use the node's bound embedding provider. These calls are on the agent tool channel, not the document lanes. Give each Astra node a distinct tool server name when an agent can reach more than one of them.
 

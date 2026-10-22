@@ -91,6 +91,24 @@ Delete documents by ID.
 
 Takes a required `object_ids` string array and removes all points whose `meta.objectId` matches. Returns `{"success": true, "deleted_count": n}`.
 
+### `list_documents`
+
+List the documents one by one, with their path and chunk count, in pages ordered by path.
+
+Pass the previous answer's `next_cursor` as `cursor` for the next page. `deleted` is `'active'` (default), `'deleted'` (the trash) or `'all'` (`true` and `false` stand for `'deleted'` and `'active'`); `parent` keeps the documents stored under exactly that path. Returns `{"success": true, "items": [...], "next_cursor": ..., "total": n}`.
+
+### `soft_delete`
+
+Move documents to the trash by ID.
+
+Takes a required `object_ids` string array. The chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. Returns `{"success": true, "object_ids": [...], "matched_chunks": n, "not_found": [...]}`, where `matched_chunks` counts the chunks moved.
+
+### `restore`
+
+Take documents out of the trash by ID.
+
+Takes a required `object_ids` string array; a document not in the trash is left as it is. Returns the same shape as `soft_delete`.
+
 ## Profiles
 
 Default: **Qdrant cloud server** (`cloud`).

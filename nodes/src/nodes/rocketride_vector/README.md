@@ -41,7 +41,7 @@ no node id the call goes to the first node in the pipeline that owns a tool of
 that name. The functions are offered only while Expose as tools is on, which
 is off by default because the table lives in a managed database and `objdir`
 and `get` together return all of it. The write functions (`upsert`, `delete`,
-and the Vector Explorer's `remove_document`) are offered only while Allow
+`soft_delete` and `restore`) are offered only while Allow
 writes through tools is also on, because they change that table. While a
 switch is off the affected functions are left out of the tool list: an agent's
 call fails with "not found in tool catalog", an app's `client.tool` call fails
@@ -58,9 +58,12 @@ wired to this node's tools.
 | `stats` | Reports the number of stored rows, the embedding model and the vector size. |
 | `upsert` | Adds or replaces a non-empty `documents` array; each needs `content` and an `object_id`. Offered only while writes are allowed. |
 | `delete` | Removes every chunk of the documents in a non-empty `object_ids` array. Offered only while writes are allowed. |
+| `list_documents` | Lists the documents one by one with their path and chunk count, in pages ordered by path; pass `next_cursor` for the next page. `deleted: 'deleted'` (or `true`) lists the trash, and `parent` keeps one exact path. |
+| `soft_delete` | Moves the documents of a non-empty `object_ids` array to the trash: their chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. Returns `matched_chunks`. Offered only while writes are allowed. |
+| `restore` | Takes the documents of a non-empty `object_ids` array out of the trash. Offered only while writes are allowed. |
 
 The Vector Explorer reads the store through the same tool surface (`dialect`,
-`documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors` and the
+`list_documents`, `chunks`, `vectors`, `sample`, `project`, `neighbors` and the
 other functions of the vector tool contract), so it too needs Expose as tools.
 
 Past those two switches, every write still passes the store's write gate. An
@@ -151,7 +154,7 @@ not restricted to the matches above the questions lane's score threshold;
 ### Allow writes through tools
 
 Off by default, and read only while Expose as tools is on. When off, `upsert`,
-`delete` and `remove_document` are not offered: an agent's call fails with
+`delete`, `soft_delete` and `restore` are not offered: an agent's call fails with
 "not found in tool catalog", an app's with the engine's "No handler found for
 tool" error.
 `search`, `objdir`, `get`, and `stats` keep working, and the documents lane

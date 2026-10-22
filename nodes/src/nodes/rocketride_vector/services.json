@@ -47,7 +47,7 @@
 	// Optional:
 	//		Description to of this driver
 	//
-	"description": ["A RocketRide-managed vector store backed by PostgreSQL + pgvector. Stores ", "and semantically searches high-dimensional embeddings in your own provisioned ", "RocketRide cloud database with zero setup — no host, user, or password to enter; ", "the engine delivers the connection to the database you choose automatically. ", "An HNSW index is created on first write so semantic search is fast from the start. ", "When Expose as tools is on, agents and apps (the Vector Explorer among them) can also use the store as tools: search, objdir, get and stats, ", "plus upsert, delete and remove_document when writes through tools are allowed."],
+	"description": ["A RocketRide-managed vector store backed by PostgreSQL + pgvector. Stores ", "and semantically searches high-dimensional embeddings in your own provisioned ", "RocketRide cloud database with zero setup — no host, user, or password to enter; ", "the engine delivers the connection to the database you choose automatically. ", "An HNSW index is created on first write so semantic search is fast from the start. ", "When Expose as tools is on, agents and apps (the Vector Explorer among them) can also use the store as tools: search, objdir, get, stats and list_documents, ", "plus upsert, delete, soft_delete and restore when writes through tools are allowed."],
 	//
 	// Optional:
 	//	  The icon is the icon to display in the UI for this node

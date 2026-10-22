@@ -36,6 +36,9 @@ The configured tool-server name defaults to `postgres`.
 | `objdir` | Lists the stored document paths, optionally under a `parent` path, with `offset` and `limit`. |
 | `get` | Returns the chunks of one `object_id` in chunk order, with `offset` and `limit`. |
 | `stats` | Reports the number of stored rows, the embedding model and the vector size. |
+| `list_documents` | Lists the documents one by one with their path and chunk count, in pages ordered by path; pass `next_cursor` for the next page. `deleted: 'deleted'` (or `true`) lists the trash, and `parent` keeps one exact path. |
+| `soft_delete` | Moves the documents of a non-empty `object_ids` array to the trash: their chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. Returns `matched_chunks`, the chunks it moved. |
+| `restore` | Takes the documents of a non-empty `object_ids` array out of the trash; a document not in it is left as it is. |
 
 `search` requires a bound embedding provider for semantic similarity search. The functions return a failure object when their required input or an embedding cannot be obtained. The collection's control record (object ID `schema`) is never listed and can never be removed through a tool.
 

@@ -32,6 +32,9 @@ The configured tool server name is the namespace for the functions below; it def
 | `search` | Search the collection for matching documents. |
 | `upsert` | Add or update documents in the collection. |
 | `delete` | Remove documents by object ID. |
+| `list_documents` | List the documents one by one with their path and chunk count, in pages ordered by path (follow `next_cursor`); `deleted: 'deleted'` lists the trash. |
+| `soft_delete` | Move documents to the trash by object ID: their chunks stay stored but leave search, `objdir`, `get` and the listing until `restore`. |
+| `restore` | Take documents out of the trash by object ID. |
 
 `search` and an `upsert` without a supplied embedding use the node's bound embedding provider. Tool invocations do not flow through the pipeline's embedding lane, so bind that provider when agents should create or search vectors automatically. Choose a distinct tool server name for each Atlas node an agent can access.
 
