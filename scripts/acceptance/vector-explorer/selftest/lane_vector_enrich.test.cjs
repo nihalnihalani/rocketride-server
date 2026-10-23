@@ -2177,8 +2177,8 @@ test('ingestVerdict and healthVerdict: the drop summary and the pin; the legacy 
 // What the lane looks for exists in the app's source (once the owning lane's code is on this branch)
 // ---------------------------------------------------------------------------
 //
-// The app's source is apps/vector-ui/src of this checkout, or VX_APP_SRC (e.g. the merged app of
-// vx/integration, checked from a lane branch whose own copy still holds the day-0 placeholders).
+// The app's source is apps/vector-ui/src of this checkout, or VX_APP_SRC (e.g. the source of a
+// merged build, checked from a checkout whose own copy still holds the day-0 placeholders).
 // Comment lines are left out before matching: a marker or a label must be in the code.
 
 const SRC = process.env.VX_APP_SRC || path.join(ACC, '..', '..', '..', 'apps', 'vector-ui', 'src');

@@ -748,8 +748,8 @@ function element(text: string, name: string): string {
 /**
  * True while views/MapView.tsx is still the day-0 mount (its Recommend tab
  * answers "Not built yet."): the map's own lane is not merged, so its wiring
- * cannot be checked yet. Once it is merged (vx/integration and after) these
- * checks run, and a missing prop fails them.
+ * cannot be checked yet. Once the map is merged these checks run, and a
+ * missing prop fails them.
  */
 function dayZeroMap(): boolean {
 	return /'Not built yet\.'/.test(source('views/MapView.tsx'));

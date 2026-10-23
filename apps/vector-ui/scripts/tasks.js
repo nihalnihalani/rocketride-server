@@ -106,8 +106,7 @@ const ALWAYS_REQUIRED_TESTS = [
 // The enrichment's suites, each with the module it tests: a suite is required
 // once its module is in the checkout, so a merge that brings a feature without
 // its suite (or drops the suite later) fails the gate instead of passing with
-// the suite never run. scripts/acceptance/vector-explorer/selftest/test_lanes.py
-// holds this list to every suite the enrichment lanes own.
+// the suite never run.
 const FEATURE_TESTS = {
 	// Scope and saved filters, charts, document health (the console).
 	'filters.test.ts': 'src/vector/filters.ts',

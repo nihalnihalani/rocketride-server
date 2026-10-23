@@ -167,8 +167,7 @@ suite it requires is missing: every one of `ALWAYS_REQUIRED_TESTS` in
 `apps/vector-ui/scripts/tasks.js`, and each suite of `FEATURE_TESTS` once the
 module it is paired with is in the checkout (the enrichment's suites, so a merge
 that brings a feature without its suite fails instead of passing with the suite
-never run). `scripts/acceptance/vector-explorer/selftest/test_lanes.py` holds
-both lists to every suite the change lanes own in `lanes.json`.
+never run).
 
 ## The write switch
 
@@ -424,12 +423,6 @@ drawing fewer edges. The points row of the edge sample records the switch too:
 a page that cannot turn it off gets one row saying so, and its edge rows are not
 measured. `gen_perf.py --check` says whether the perf fixture's sample can
 carry every edge row.
-
-`scripts/acceptance/vector-explorer/lanes.json` lists which change lane owns
-which file in a multi-lane build of the app, the commit the lanes branch from
-and the order they merge in; `selftest/test_lanes.py diff-all` reports every
-lane branch's changes outside its list and `day0` checks the list against that
-commit.
 
 ## Fixtures
 
