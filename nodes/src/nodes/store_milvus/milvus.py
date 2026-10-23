@@ -63,6 +63,9 @@ MAX_QUERY_WINDOW = 16384
 # Documents whose rows one read of markDeleted / markActive covers
 MARK_IDS_PER_QUERY = 100
 
+# Empty chunk-id windows in a row after which that read stops (the rest is left unread)
+MARK_EMPTY_WINDOWS_MAX = 64
+
 # objectId of the collection's control record
 CONTROL_OBJECT_ID = 'schema'
 
@@ -856,6 +859,11 @@ class Store(DocumentStoreBase):
         documents at a time, by windows of chunk ids small enough that one query holds a
         whole window. Chunk ids do not change when a row is upserted, so marking the rows
         of one page does not move a row into or out of another.
+
+        A count(*) ends each read. So that a count which keeps answering rows the windows
+        never return cannot keep it going, a read also stops after MARK_EMPTY_WINDOWS_MAX
+        empty windows in a row; what it did not return is left unread (and unmarked, so the
+        callers' counts stay the rows they changed).
         """
         ids = [str(oid) for oid in dict.fromkeys(objectIds or [])]
         for start in range(0, len(ids), MARK_IDS_PER_QUERY):
@@ -864,6 +872,7 @@ class Store(DocumentStoreBase):
             window = max(1, MAX_QUERY_WINDOW // len(batch))
             remaining = self._countWhere([of_batch])
             low = 0
+            empty = 0
             while remaining > 0:
                 rows = self.client.query(
                     collection_name=self.collection,
@@ -873,10 +882,19 @@ class Store(DocumentStoreBase):
                 )
                 if rows:
                     remaining -= len(rows)
+                    empty = 0
                     yield rows
                 elif not self._countWhere([of_batch, f"meta['chunkId'] >= {low + window}"]):
                     # Nothing past this window either: the rest has no chunk id to page by
                     break
+                else:
+                    empty += 1
+                    if empty >= MARK_EMPTY_WINDOWS_MAX:
+                        engLib.debug(
+                            f'Milvus: stopped reading the rows of {len(batch)} documents after '
+                            f'{MARK_EMPTY_WINDOWS_MAX} empty chunk-id windows; {remaining} counted rows were not read'
+                        )
+                        break
                 low += window
 
     @_backend_errors('markDeleted')

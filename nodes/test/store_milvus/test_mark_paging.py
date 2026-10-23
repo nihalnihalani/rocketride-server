@@ -78,3 +78,23 @@ def test_no_query_asks_past_the_query_window(store, adapter, monkeypatch):
     monkeypatch.setattr(store.client, 'query', spy)
     store.markDeleted(list(CHUNKS))
     assert asked and max(asked) <= 4, asked
+
+
+def test_a_count_that_never_reaches_zero_does_not_keep_the_read_going(store, monkeypatch):
+    """A count(*) that answers rows the windowed reads never return ends at the driver's own bound."""
+    total = sum(len(ids) for ids in CHUNKS.values())
+    counted = store._countWhere
+    monkeypatch.setattr(store, '_countWhere', lambda conditions: counted(conditions) + 5)
+    query = store.client.query
+    calls = []
+
+    def bounded(**kw):
+        calls.append(kw)
+        if len(calls) > 2000:
+            raise RuntimeError('the mark read did not stop')
+        return query(**kw)
+
+    monkeypatch.setattr(store.client, 'query', bounded)
+    assert store.markDeleted(list(CHUNKS)) == total, 'every row the reads returned is marked, and counted once'
+    assert all(_flags(store).values())
+    assert len(calls) < 400, len(calls)
