@@ -34,7 +34,8 @@
 
 /**
  * A single node in the hierarchical call tree returned by the server.
- * Matches the CProfileTreeNode shape from the client SDK.
+ * Matches the CProfileTreeNode shape from the client SDK: below the first
+ * level the numbers are this path's share of the caller → callee totals.
  */
 export interface ProfileTreeNode {
 	/** Function name. */
@@ -43,7 +44,7 @@ export interface ProfileTreeNode {
 	file: string;
 	/** Source line number. */
 	line: number;
-	/** Number of calls from the parent context. */
+	/** Number of calls from the parent context (this path's share, rounded). */
 	ncalls: number;
 	/** Total time spent in this function (excluding sub-calls). */
 	tottime: number;
@@ -58,15 +59,69 @@ export interface ProfileTreeNode {
 // =============================================================================
 
 /**
+ * One function's totals over the session (or thread), as the text report prints them.
+ * Matches the CProfileFunctionStats shape from the client SDK.
+ */
+export interface ProfileFunctionStats {
+	/** Function name. */
+	name: string;
+	/** Source filename. */
+	file: string;
+	/** Source line number. */
+	line: number;
+	/** Total number of calls. */
+	ncalls: number;
+	/** Self time (excluding sub-calls). */
+	tottime: number;
+	/** Cumulative time (including sub-calls). */
+	cumtime: number;
+}
+
+/**
  * Full response from rrext_cprofile_report_tree.
  */
 export interface ProfileTreeResponse {
 	/** Root node of the call tree (synthetic '<root>' wrapper). */
 	tree: ProfileTreeNode | null;
-	/** Total cumulative time across all profiled functions. */
+	/** Per-function totals, filtered like the tree; absent from older servers. */
+	functions?: ProfileFunctionStats[];
+	/** How long the profiled threads ran — the selected thread, or all of them summed. */
 	total_time: number;
 	/** Total number of function calls recorded. */
 	total_calls: number;
+	/** Error message if no data is available. */
+	error?: string;
+}
+
+// =============================================================================
+// THREADS
+// =============================================================================
+
+/**
+ * One profiled thread from rrext_cprofile_threads.
+ * Matches the CProfileThreadInfo shape from the client SDK.
+ */
+export interface ProfileThreadInfo {
+	/** Thread id within the session — the `thread` argument of rrext_cprofile_report_tree. */
+	id: number;
+	/** Thread name, or null if never resolved. Not unique. */
+	name: string | null;
+	/** System thread id (Python's threading.get_ident()) — tells apart threads that share a name. */
+	tid: number;
+	/** Time attributed to this thread, in seconds. */
+	ttot: number;
+	/** Number of times the thread was scheduled while profiled. */
+	sched_count: number;
+	/** Number of distinct functions recorded on this thread. */
+	functions: number;
+	/** Total number of calls recorded on this thread. */
+	calls: number;
+}
+
+/** Full response from rrext_cprofile_threads. */
+export interface ProfileThreadsResponse {
+	/** Threads of the last completed session, busiest first. */
+	threads: ProfileThreadInfo[];
 	/** Error message if no data is available. */
 	error?: string;
 }

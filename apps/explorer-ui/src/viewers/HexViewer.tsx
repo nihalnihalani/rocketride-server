@@ -35,7 +35,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import type { RocketRideClient } from 'rocketride';
+import type { RocketRideClient } from 'shell';
 import { viewerStyles } from './styles';
 
 // -----------------------------------------------------------------------------
@@ -420,7 +420,7 @@ class RangeDataSource {
 			// file — cancel the body so a multi-GB response isn't buffered into memory.
 			if (response.status === 200) {
 				await response.body?.cancel();
-				this._recordFailure(chunkIndex, 'Server ignored Range header (200) — partial content unsupported');
+				this._recordFailure(chunkIndex, 'Server ignored Range header (200); partial content unsupported');
 			} else {
 				this._recordFailure(chunkIndex, `Expected 206, got ${response.status}`);
 			}

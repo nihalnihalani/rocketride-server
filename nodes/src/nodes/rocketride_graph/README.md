@@ -36,7 +36,7 @@ node defines no configurable server-name prefix. Inputs are JSON objects.
 | get_data | Converts required natural-language question to a safe read-only Cypher query and returns rows; limit is optional. |
 | get_schema | Returns the discovered labels, sampled node properties, and relationships. |
 | get_query | Converts required natural-language question to read-only Cypher without executing it; limit is optional. |
-| execute | Runs required raw Cypher query when direct execution is enabled. |
+| execute | Runs required raw Cypher query when direct execution is enabled; optional params binds `$name` values (for example `{"rows": [...]}` for `UNWIND $rows`), which need no escaping and do not count toward the 10,000-character query limit (params JSON is capped at 8 MiB). The statement may also be sent as sql, the key client.database.query uses; session_id and row_mode 'array' are refused, because graph nodes have no transactions and return row objects. If the result has more rows than the execute row limit, the call fails and nothing is saved. On AGE 1.5.0, `UNWIND $rows ... MERGE` creates duplicates when rows repeat a key, so remove repeated keys first. |
 | dialect | Returns {"dialect": "age"}. |
 
 get_data defaults to the shared read limit, then clamps the requested limit to
@@ -49,6 +49,17 @@ get_query returns {query, valid: true} only after its safe-query checks.
 execute bypasses the read-only gate but still passes Cypher through the AGE
 translation and resource limits; it raises if direct execution is disabled or
 the input is invalid, and otherwise returns {rows, affected_rows}.
+
+The translator also guards two AGE 1.5.0 gaps that would otherwise return wrong
+data without an error. An empty-list test such as `x IN []` is rewritten to
+`false`, its standard Cypher value. AGE applies SET, REMOVE and DELETE only to
+the first node or edge a MERGE creates in a statement, so after a MERGE these
+are rejected unless they change a variable bound before that MERGE, or the node
+of a single-node MERGE that starts the query. For a bulk upsert, run the MERGE,
+then the SET as a separate execute call, for example
+`UNWIND $rows AS row MATCH (n:Item {id: row.id}) SET n.name = row.name`.
+Properties written inside the MERGE pattern are stored, but MERGE matches on
+them: with different values it creates a second node or edge.
 
 ## Configuration
 
@@ -92,12 +103,50 @@ execute tool and QuestionType.EXECUTE; those calls skip LLM translation and the
 safe read-only gate. They still use the AGE translator and its resource
 controls. Enable it only for trusted callers that require writes or raw Cypher.
 
+### Database
+
+Database picks which RocketRide cloud database the node uses. It defaults to
+Organization, so existing pipelines keep using the database they already had.
+
+- **Organization**: the database shared by everyone in the organization the
+  pipeline runs in. Data from before this choice existed lives here.
+- **Team**: the database of the run's team. A run from the builder uses your
+  current dev team and needs run rights (task.control) on it; a deployed
+  pipeline uses the team it is billed to.
+- **Personal**: your own database in this organization. It works only when you
+  are the person running the pipeline: builder runs, store apps you run, and
+  pipelines you deploy for yourself (@me). A pipeline deployed for a team has
+  no person behind it, so it fails at start with an error that says so.
+  Organization admins can reach members' personal databases, and that access
+  is logged.
+
+Each choice is a separate database. Switching does not move or copy data, and
+a database you have not used yet is created empty on the first run that needs
+it. Every database, new ones included, comes with a graph named rocketride, so the
+default Graph name works in each.
+
+A pipeline exposed through a public link (a chat, dropper, webhook, Discord or
+Telegram source) runs as you, so visitors' requests use your team or personal
+database, not their own.
+
+Access is checked when the run starts. If the run may not use the chosen
+database, it does not start, and the error says which database and why. A
+self-hosted engine supports only Organization; Team and Personal fail at start
+because they need RocketRide cloud. Access is approved for the whole run, not
+each node: every node in a run can reach every database the run was approved
+for.
+
 ## Limitations
 
 This node runs on the RocketRide engine host and does not support remote
 execution. The engine host must have access to the signed-in RocketRide
-identity used to resolve the tenant DSN. The tenant database must already have
-Apache AGE installed and contain the configured graph. Read paths are
+identity used to resolve the tenant DSN; on a server without a RocketRide cloud
+database (for example, a local or self-hosted engine with no database broker) the
+task fails at start with a message that says so; use a connection-configured
+node such as graph_neo4j or graph_falkordb there. On RocketRide Cloud, missing
+broker configuration is a server configuration error: contact the server
+operator to restore it and retry. The tenant database must
+already have Apache AGE installed and contain the configured graph. Read paths are
 intentionally read-only; raw execution remains disabled until explicitly
 enabled.
 
@@ -113,4 +162,25 @@ and samples relationship endpoints; an individual reflection failure warns and
 returns partial rather than blocking all schema output.
 
 <!-- ROCKETRIDE:GENERATED:PARAMS START -->
+<!-- Generated by nodes:docs-generate. Do not edit by hand. -->
+
+## Schema
+
+| Field | Type | Description | Default |
+|---|---|---|---|
+| `rocketridegraph.allow_execute` | `boolean` | **Allow direct query execution**<br/>Permit QuestionType.EXECUTE callers to run raw Cypher without LLM translation or read-only safety checks. Resource limits still apply. Leave OFF unless a trusted application explicitly needs to issue Cypher directly. | `false` |
+| `rocketridegraph.db_description` | `string` | **Graph description**<br/>What is this graph used for? Describe its content and purpose, this helps the LLM generate more accurate queries. | `""` |
+| `rocketridegraph.graph` | `string` | **Graph name**<br/>Name of the AGE graph to query in your RocketRide cloud database | `"rocketride"` |
+| `rocketridegraph.max_attempts` | `integer` | **Max validation attempts**<br/>Maximum number of times to re-ask the LLM if validation rejects the generated Cypher | `5` |
+| `rocketridegraph.max_rows` | `integer` | **Max read rows**<br/>Row ceiling for read queries on the questions lane and get_data tool | `1000` |
+| `rocketridegraph.profile` | `string` |  | `"default"` |
+| `rocketridegraph.query_timeout_ms` | `integer` | **Query timeout (ms)**<br/>Per-query statement timeout applied inside each query's transaction | `30000` |
+
+## Dependencies
+
+- `psycopg2-binary` `==2.9.12`
+
+## Source
+
+[<svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true" style="vertical-align:-0.15em;margin-right:0.35em"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg> View source](https://github.com/rocketride-org/rocketride-server/tree/develop/nodes/src/nodes/rocketride_graph)
 <!-- ROCKETRIDE:GENERATED:PARAMS END -->

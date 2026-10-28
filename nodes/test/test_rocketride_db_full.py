@@ -27,9 +27,8 @@
 
 Runs the ``rocketride_sql`` and ``rocketride_vector`` nodes end-to-end against
 a local PostgreSQL container standing in for the cloud data-core, connected
-through the real seam (env ``ROCKETRIDE_CLIENT_ID`` + a fake, injectable
-``Account.resolve_db_dsn`` — exactly how tests are meant to swap the resolver;
-node code is identical regardless of which resolver is active).
+through the real seam (the DSN delivered in ``ROCKETRIDE_DB_DSNS``, as the
+task engine does).
 
 Requires a container on the live pin (PG16 + pgvector), e.g.::
 
@@ -48,10 +47,13 @@ Skips cleanly when the database is unreachable.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import urllib.parse
 import types
+
+from ._store_base_stubs import store_base_stubs
 
 from pathlib import Path
 
@@ -61,6 +63,7 @@ _REPO = Path(__file__).resolve().parents[2]
 _AI_SRC = _REPO / 'packages' / 'ai' / 'src'
 _RRDB_PATH = _AI_SRC / 'ai' / 'common' / 'rocketride_db.py'
 _DB_BASE_DIR = _AI_SRC / 'ai' / 'common' / 'database'
+_UTILS_DIR = _AI_SRC / 'ai' / 'common' / 'utils'
 _SQL_NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'rocketride_sql'
 _VEC_NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'rocketride_vector'
 
@@ -68,7 +71,6 @@ TEST_DSN = os.environ.get('RR_TEST_PG_DSN', 'postgresql://rruser:rrpass@localhos
 # Derived, not hardcoded: the suite must also run against a provisioned tenant
 # DSN (e.g. t_<slug>_<hash> through a pooler), not just the default container.
 TEST_DB_NAME = urllib.parse.urlparse(TEST_DSN).path.lstrip('/')
-TEST_CLIENT_ID = 'tenant-integration-test'
 
 # RR_REQUIRE_DB_TESTS (set by CI once its DB containers are healthy) turns
 # every skip in this module into a hard failure: a broken container or missing
@@ -102,12 +104,14 @@ if _DB_TESTS_REQUIRED and not _db_reachable():
 pytestmark = pytest.mark.skipif(not _db_reachable(), reason=f'RocketRide test database not reachable at {TEST_DSN}')
 
 
-def _load_from_path(name: str, path: Path, *, is_package: bool = False):
+def _load_from_path(name: str, path: Path, *, is_package: bool = False, register: bool = True):
+    """Load a module from ``path``, optionally exposing it through ``sys.modules``."""
     search = [str(path.parent)] if is_package else None
     spec = importlib.util.spec_from_file_location(name, path, submodule_search_locations=search)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
+    if register:
+        sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -117,8 +121,7 @@ def _load_from_path(name: str, path: Path, *, is_package: bool = False):
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def rr_env(monkeypatch):
+def _build_rr_env(monkeypatch):
     """Stub the engine surface and install the fake DSN resolver."""
     warnings: list[str] = []
 
@@ -180,6 +183,8 @@ def rr_env(monkeypatch):
                 'maxChunkId',
             ):
                 setattr(self, name, kw.get(name))
+            # The drivers page with these since #2631; the stand-in must carry them too.
+            self.offset = kw.get('offset', 0)
             self.limit = kw.get('limit', 10)
 
     class _QuestionText(str):
@@ -221,7 +226,12 @@ def rr_env(monkeypatch):
                 self._createCollection(len(documents[0].embedding))
             return True
 
+    # rocketride_vector's IGlobal / IInstance sit on the store base since #2587;
+    # these tests drive the driver Store directly, so only the names matter.
+    bases = store_base_stubs()
     store_mod.DocumentStoreBase = _StubDocumentStoreBase
+    store_mod.StoreGlobalBase = bases.StoreGlobalBase
+    store_mod.StoreInstanceBase = bases.StoreInstanceBase
 
     monkeypatch.setitem(sys.modules, 'ai', ai_pkg)
     monkeypatch.setitem(sys.modules, 'ai.common', common_pkg)
@@ -231,29 +241,66 @@ def rr_env(monkeypatch):
     monkeypatch.setitem(sys.modules, 'ai.common.transform', transform)
     monkeypatch.setitem(sys.modules, 'ai.common.store', store_mod)
 
-    rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH)
+    config_utils = _load_from_path(
+        'ai.common.utils.config_utils',
+        _UTILS_DIR / 'config_utils.py',
+        register=False,
+    )
+    utils = types.ModuleType('ai.common.utils')
+    utils.parse_bool = config_utils.parse_bool
+    monkeypatch.setitem(sys.modules, 'ai.common.utils', utils)
+
+    rrdb_mod = _load_from_path('ai.common.rocketride_db', _RRDB_PATH, register=False)
     monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', rrdb_mod)
 
-    # The injectable fake resolver: same seam a SaaS build fills in.
-    account_mod = types.ModuleType('ai.account')
-
-    async def fake_resolve_db_dsn(client_id):
-        assert client_id == TEST_CLIENT_ID
-        return TEST_DSN
-
-    account_mod.account = types.SimpleNamespace(resolve_db_dsn=fake_resolve_db_dsn)
-    monkeypatch.setitem(sys.modules, 'ai.account', account_mod)
-    monkeypatch.setenv('ROCKETRIDE_CLIENT_ID', TEST_CLIENT_ID)
-    monkeypatch.delenv('ROCKETRIDE_DB_DSN', raising=False)
+    # Deliver the DSN the way the task engine does: nodes never resolve one.
+    monkeypatch.setenv('ROCKETRIDE_DB_DSNS', json.dumps({'org': TEST_DSN}))
 
     return types.SimpleNamespace(schema=schema, warnings=warnings)
 
 
 @pytest.fixture()
+def rr_env(monkeypatch):
+    """Provide isolated engine stubs and a fake DSN resolver for one test."""
+    return _build_rr_env(monkeypatch)
+
+
+@pytest.fixture()
 def raw_conn():
+    """Yield a raw connection to the configured PostgreSQL test database."""
     conn = psycopg2.connect(TEST_DSN)
     yield conn
     conn.close()
+
+
+def test_rr_env_does_not_leak_module_aliases(monkeypatch):
+    """Remove temporary module aliases when fixture setup has no prior state."""
+    aliases = ('ai.common.rocketride_db', 'ai.common.utils')
+    for alias in aliases:
+        monkeypatch.delitem(sys.modules, alias, raising=False)
+
+    with monkeypatch.context() as fixture_patch:
+        _build_rr_env(fixture_patch)
+        assert 'ai.common.rocketride_db' in sys.modules
+        assert 'ai.common.utils' in sys.modules
+
+    assert all(alias not in sys.modules for alias in aliases)
+
+
+def test_rr_env_restores_existing_module_aliases(monkeypatch):
+    """Restore aliases registered by previously collected suites."""
+    existing_rocketride_db = types.ModuleType('ai.common.rocketride_db')
+    existing_utils = types.ModuleType('ai.common.utils')
+    monkeypatch.setitem(sys.modules, 'ai.common.rocketride_db', existing_rocketride_db)
+    monkeypatch.setitem(sys.modules, 'ai.common.utils', existing_utils)
+
+    with monkeypatch.context() as fixture_patch:
+        _build_rr_env(fixture_patch)
+        assert sys.modules['ai.common.rocketride_db'] is not existing_rocketride_db
+        assert sys.modules['ai.common.utils'] is not existing_utils
+
+    assert sys.modules['ai.common.rocketride_db'] is existing_rocketride_db
+    assert sys.modules['ai.common.utils'] is existing_utils
 
 
 # ---------------------------------------------------------------------------
@@ -262,25 +309,38 @@ def raw_conn():
 
 
 def _load_sql_node(monkeypatch):
-    db_global = _load_from_path('ai.common.database.db_global_base', _DB_BASE_DIR / 'db_global_base.py')
-    sql_safety = _load_from_path('ai.common.database.sql_safety', _DB_BASE_DIR / 'sql_safety.py')
+    db_global = _load_from_path(
+        'ai.common.database.db_global_base',
+        _DB_BASE_DIR / 'db_global_base.py',
+        register=False,
+    )
+    sql_safety = _load_from_path(
+        'ai.common.database.sql_safety',
+        _DB_BASE_DIR / 'sql_safety.py',
+        register=False,
+    )
     database_pkg = types.ModuleType('ai.common.database')
     database_pkg.__path__ = [str(_DB_BASE_DIR)]
     database_pkg.DatabaseGlobalBase = db_global.DatabaseGlobalBase
     monkeypatch.setitem(sys.modules, 'ai.common.database', database_pkg)
     monkeypatch.setitem(sys.modules, 'ai.common.database.db_global_base', db_global)
     monkeypatch.setitem(sys.modules, 'ai.common.database.sql_safety', sql_safety)
-    db_instance = _load_from_path('ai.common.database.db_instance_base', _DB_BASE_DIR / 'db_instance_base.py')
+    db_instance = _load_from_path(
+        'ai.common.database.db_instance_base',
+        _DB_BASE_DIR / 'db_instance_base.py',
+        register=False,
+    )
     database_pkg.DatabaseInstanceBase = db_instance.DatabaseInstanceBase
     monkeypatch.setitem(sys.modules, 'ai.common.database.db_instance_base', db_instance)
 
-    iglobal = _load_from_path('nodes.rocketride_sql.IGlobal', _SQL_NODE_DIR / 'IGlobal.py')
+    iglobal = _load_from_path('nodes.rocketride_sql.IGlobal', _SQL_NODE_DIR / 'IGlobal.py', register=False)
     pkg = types.ModuleType('nodes.rocketride_sql')
     pkg.__path__ = [str(_SQL_NODE_DIR)]
     pkg.IGlobal = iglobal
     monkeypatch.setitem(sys.modules, 'nodes.rocketride_sql', pkg)
     monkeypatch.setitem(sys.modules, 'nodes.rocketride_sql.IGlobal', iglobal)
-    iinstance = _load_from_path('nodes.rocketride_sql.IInstance', _SQL_NODE_DIR / 'IInstance.py')
+    iinstance = _load_from_path('nodes.rocketride_sql.IInstance', _SQL_NODE_DIR / 'IInstance.py', register=False)
+    monkeypatch.setitem(sys.modules, 'nodes.rocketride_sql.IInstance', iinstance)
     return iglobal.IGlobal, iinstance.IInstance
 
 
@@ -338,27 +398,6 @@ class TestRocketrideSqlE2E:
         finally:
             glb.endGlobal()
 
-    def test_begin_global_via_injected_env_dsn(self, rr_env, monkeypatch, sql_table):
-        """The production delivery path: the task engine resolves server-side and
-        injects ROCKETRIDE_DB_DSN; the node-side account is never consulted.
-        """
-        import types as _types
-
-        async def poisoned(client_id):  # pragma: no cover — must not be reached
-            raise AssertionError('account must not be consulted when ROCKETRIDE_DB_DSN is injected')
-
-        monkeypatch.setitem(
-            sys.modules, 'ai.account', _types.SimpleNamespace(account=_types.SimpleNamespace(resolve_db_dsn=poisoned))
-        )
-        monkeypatch.setenv('ROCKETRIDE_DB_DSN', TEST_DSN)
-        glb, inst = self._begin(monkeypatch, {'table': sql_table, 'allow_execute': True})
-        try:
-            assert glb.database == TEST_DB_NAME
-            rows = inst.execute({'sql': f'SELECT count(*) AS n FROM {sql_table}'})
-            assert rows['rows'][0]['n'] == 2
-        finally:
-            glb.endGlobal()
-
     def test_config_connection_fields_ignored(self, rr_env, monkeypatch, sql_table):
         """The defining property: config cannot redirect the connection."""
         glb, _ = self._begin(
@@ -378,14 +417,70 @@ class TestRocketrideSqlE2E:
 
 
 def _load_vector_store(monkeypatch):
-    iglobal = _load_from_path('nodes.rocketride_vector.IGlobal', _VEC_NODE_DIR / 'IGlobal.py')
+    iglobal = _load_from_path('nodes.rocketride_vector.IGlobal', _VEC_NODE_DIR / 'IGlobal.py', register=False)
     pkg = types.ModuleType('nodes.rocketride_vector')
     pkg.__path__ = [str(_VEC_NODE_DIR)]
     pkg.IGlobal = iglobal
     monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector', pkg)
     monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector.IGlobal', iglobal)
-    store = _load_from_path('nodes.rocketride_vector.rocketride_vector', _VEC_NODE_DIR / 'rocketride_vector.py')
+    store = _load_from_path(
+        'nodes.rocketride_vector.rocketride_vector',
+        _VEC_NODE_DIR / 'rocketride_vector.py',
+        register=False,
+    )
+    monkeypatch.setitem(sys.modules, 'nodes.rocketride_vector.rocketride_vector', store)
     return store.Store
+
+
+_NODE_LOADER_ALIASES = (
+    (
+        _load_sql_node,
+        (
+            'ai.common.database',
+            'ai.common.database.db_global_base',
+            'ai.common.database.sql_safety',
+            'ai.common.database.db_instance_base',
+            'nodes.rocketride_sql',
+            'nodes.rocketride_sql.IGlobal',
+            'nodes.rocketride_sql.IInstance',
+        ),
+    ),
+    (
+        _load_vector_store,
+        (
+            'nodes.rocketride_vector',
+            'nodes.rocketride_vector.IGlobal',
+            'nodes.rocketride_vector.rocketride_vector',
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize(('loader', 'aliases'), _NODE_LOADER_ALIASES)
+def test_node_loader_does_not_leak_module_aliases(rr_env, monkeypatch, loader, aliases):
+    """Remove every temporary node alias when no prior module was loaded."""
+    for alias in aliases:
+        monkeypatch.delitem(sys.modules, alias, raising=False)
+
+    with monkeypatch.context() as loader_patch:
+        loader(loader_patch)
+        assert all(alias in sys.modules for alias in aliases)
+
+    assert all(alias not in sys.modules for alias in aliases)
+
+
+@pytest.mark.parametrize(('loader', 'aliases'), _NODE_LOADER_ALIASES)
+def test_node_loader_restores_existing_module_aliases(rr_env, monkeypatch, loader, aliases):
+    """Restore real modules that were present before a temporary node load."""
+    existing = {alias: types.ModuleType(alias) for alias in aliases}
+    for alias, module in existing.items():
+        monkeypatch.setitem(sys.modules, alias, module)
+
+    with monkeypatch.context() as loader_patch:
+        loader(loader_patch)
+        assert all(sys.modules[alias] is not existing[alias] for alias in aliases)
+
+    assert all(sys.modules[alias] is existing[alias] for alias in aliases)
 
 
 VEC_TABLE = 'rr_vec_e2e'
@@ -406,9 +501,8 @@ class TestRocketrideVectorE2E:
         store_cls = _load_vector_store(monkeypatch)
         store = store_cls('rocketride_vector', {'collection': VEC_TABLE, 'similarity': 'cosine'}, {})
         yield store
-        # Close the driver connection before dropping: the driver's SELECT
-        # paths (mirroring vectordb_postgres) leave the session idle in
-        # transaction, and its AccessShare lock would block the DROP.
+        # Close the driver connection before dropping, so a test that leaves
+        # it inside a transaction cannot block the DROP on its locks.
         if store.client is not None:
             store.client.close()
             store.client = None
@@ -511,6 +605,78 @@ class TestRocketrideVectorE2E:
         replacement = self._chunks(rr_env.schema, [('replaced', _unit_vec(rng))])
         vec_store.addChunks(replacement)
         assert vec_store.count_documents() == 1
+
+    # A transaction-mode pooler (PgBouncer) holds a server connection for as
+    # long as a client sits inside a transaction. A long-lived node left
+    # "idle in transaction" pins one of the database's few pooler slots for
+    # its whole lifetime, so between calls the session must be plain "idle".
+    @staticmethod
+    def _session_state(raw_conn, store) -> str:
+        """The node's backend state as the server sees it (pg_stat_activity)."""
+        with raw_conn.cursor() as cur:
+            cur.execute('SELECT state FROM pg_stat_activity WHERE pid = %s', (store.client.get_backend_pid(),))
+            state = cur.fetchone()[0]
+        # pg_stat_activity is snapshotted per transaction: end ours so the
+        # next probe sees fresh state.
+        raw_conn.rollback()
+        return state
+
+    def test_session_idle_after_connect(self, rr_env, vec_store, raw_conn):
+        assert self._session_state(raw_conn, vec_store) == 'idle'
+
+    def test_session_idle_after_each_read(self, rr_env, vec_store, raw_conn):
+        rng = np.random.default_rng(41)
+        vectors = [(f'doc {i}', _unit_vec(rng)) for i in range(5)]
+        vec_store.addChunks(self._chunks(rr_env.schema, vectors))
+        assert self._session_state(raw_conn, vec_store) == 'idle', 'after addChunks'
+
+        query = rr_env.schema.QuestionText('doc')
+        query.embedding = vectors[0][1]
+        reads = {
+            '_doesCollectionExist': lambda: vec_store._doesCollectionExist(),
+            'count_documents': lambda: vec_store.count_documents(),
+            'searchSemantic': lambda: vec_store.searchSemantic(query, rr_env.schema.DocFilter(limit=5)),
+            'searchKeyword': lambda: vec_store.searchKeyword(query, rr_env.schema.DocFilter(limit=5)),
+            'get': lambda: vec_store.get(rr_env.schema.DocFilter(limit=5)),
+            'getPaths': lambda: vec_store.getPaths(),
+            'render': lambda: vec_store.render('obj-0', lambda _text: None),
+        }
+        for name, read in reads.items():
+            read()
+            assert self._session_state(raw_conn, vec_store) == 'idle', f'after {name}'
+
+    def test_session_idle_after_each_single_statement_write(self, rr_env, vec_store, raw_conn):
+        rng = np.random.default_rng(43)
+        vec_store.addChunks(self._chunks(rr_env.schema, [('doc', _unit_vec(rng))]))
+        for name in ('markDeleted', 'markActive', 'remove'):
+            getattr(vec_store, name)(['obj-0'])
+            assert self._session_state(raw_conn, vec_store) == 'idle', f'after {name}'
+
+    def test_session_idle_after_failed_read(self, rr_env, vec_store, raw_conn):
+        rng = np.random.default_rng(47)
+        vec_store.addChunks(self._chunks(rr_env.schema, [('doc', _unit_vec(rng))]))
+        query = rr_env.schema.QuestionText('doc')
+        query.embedding = [1.0, 0.0]  # wrong width: the server rejects the comparison
+        with pytest.raises(Exception, match='dimensions'):
+            vec_store.searchSemantic(query, rr_env.schema.DocFilter(limit=5))
+        assert self._session_state(raw_conn, vec_store) == 'idle'
+        # ...and the connection is still usable (no aborted transaction).
+        assert vec_store.count_documents() == 1
+
+    def test_session_idle_after_failed_write(self, rr_env, vec_store, raw_conn):
+        rng = np.random.default_rng(53)
+        vec_store.addChunks(self._chunks(rr_env.schema, [('original', _unit_vec(rng))]))
+        bad = self._chunks(rr_env.schema, [('replacement', _unit_vec(rng))])
+        bad[0].embedding = [1.0, 0.0]  # wrong width: the INSERT fails after the DELETE ran
+        with pytest.raises(Exception):
+            vec_store.addChunks(bad, checkCollection=False)
+        assert self._session_state(raw_conn, vec_store) == 'idle'
+        # The replacement is still atomic: the failed batch left the original in place.
+        docs = vec_store.get(rr_env.schema.DocFilter(objectIds=['obj-0'], limit=5))
+        assert [d.page_content for d in docs] == ['original']
+        # ...and the connection is back in autocommit, so later reads open no transaction.
+        assert vec_store.client.autocommit is True
+        assert self._session_state(raw_conn, vec_store) == 'idle', 'after a read following the failed write'
 
     def test_wide_vectors_skip_index_with_warning(self, rr_env, monkeypatch, raw_conn):
         wide_table = 'rr_vec_wide_e2e'

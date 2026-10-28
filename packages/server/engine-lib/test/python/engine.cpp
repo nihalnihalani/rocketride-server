@@ -50,3 +50,37 @@ TEST_CASE("python::config") {
 TEST_CASE("python::webhook") {
     REQUIRE_NO_ERROR(engine::python::loadModule("nodes.webhook", true));
 }
+
+TEST_CASE("python::isCancelled observes native cancellation") {
+    const auto python = localfcn()->Error {
+        auto isCancelled = py::module_::import("rocketlib").attr("isCancelled");
+        REQUIRE_FALSE(isCancelled().cast<bool>());
+
+        // Set just the flag: globalCancel() also arms a process-exit failsafe.
+        // Restore it on every exit so other tests are not cancelled.
+        util::Guard cancelScope{
+            [&] { ap::async::globalCancelFlag() = true; },
+            [&] { ap::async::globalCancelFlag() = false; }};
+        REQUIRE(isCancelled().cast<bool>());
+        return {};
+    };
+
+    REQUIRE_NO_ERROR(callPython(python));
+    REQUIRE_FALSE(ap::async::cancelled());
+}
+
+TEST_CASE("python::an error keeps its location after the next exception") {
+    // Same-length names: a location that views the shared exception
+    // buffers would read the second name in place of the first
+    const auto first = callPython(localfcn()->Error {
+        py::exec("def first_fn():\n    raise ValueError('a')\nfirst_fn()\n");
+        return {};
+    });
+    const auto second = callPython(localfcn()->Error {
+        py::exec("def other_fn():\n    raise ValueError('b')\nother_fn()\n");
+        return {};
+    });
+
+    REQUIRE(first.location().function() == "first_fn");
+    REQUIRE(second.location().function() == "other_fn");
+}

@@ -162,8 +162,11 @@ inline auto __call(Location location, Call &&call, Args &&...args) noexcept {
         }
 
         // Create a new location indicator pointing to the python code and using
-        // the full path
-        Location pyloc{excPath, excLineno, excFunction, true};
+        // the full path. Location holds string_views and excPath/excFunction
+        // are overwritten by the next exception, so view interned copies that
+        // live for the process instead
+        Location pyloc{internLocationText(excPath), excLineno,
+                       internLocationText(excFunction), true};
 
         // Create the error and return it
         auto result = Error{errorCode, pyloc, errorMessage};
@@ -183,6 +186,10 @@ inline Error __callPython(Location location, Call &&cb,
 
     // Setup our thread debug if needed
     engine::python::setupDebug();
+
+    // Hook this thread into an active profiling session. MUST stay after
+    // setupDebug(), which is what names the thread for yappi's contexts
+    engine::python::setupProfiler();
 
     // Call it
     if (auto res = engine::python::__call(location, std::forward<Call>(cb),

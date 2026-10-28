@@ -26,7 +26,7 @@ import { TransportWebSocket } from './core/TransportWebSocket.js';
 import { redactProtocolMessage } from './core/TransportBase.js';
 import { DAPClient } from './core/DAPClient.js';
 import { DAPMessage, EventCallback, RocketRideClientConfig, ConnectCallback, DisconnectCallback, ConnectErrorCallback, ConnectResult, ServerInfoResult, TraceType } from './types/index.js';
-import { TASK_STATUS, UPLOAD_RESULT, PIPELINE_RESULT, PipelineConfig, DashboardResponse, ListPageRequest, ListConnectionsResponse, ListTasksResponse, ServicesResponse, ServiceDefinition, ValidationResult, CProfileStatusResponse, CProfileStopResponse, CProfileReportResponse, CProfileReportTreeResponse } from './types/index.js';
+import { TASK_STATUS, UPLOAD_RESULT, PIPELINE_RESULT, PipelineConfig, DashboardResponse, ListPageRequest, ListConnectionsResponse, ListTasksResponse, ServicesResponse, ServiceDefinition, ValidationResult, CProfileStatusResponse, CProfileStopResponse, CProfileReportResponse, CProfileReportTreeResponse, CProfileThreadsResponse } from './types/index.js';
 import { CONST_DEFAULT_WEB_CLOUD, CONST_DEFAULT_WEB_PROTOCOL, CONST_DEFAULT_WEB_PORT } from './constants.js';
 import { Question } from './schema/Question.js';
 import { AccountApi } from './account.js';
@@ -2852,6 +2852,64 @@ export class RocketRideClient extends DAPClient {
 		return (body as any)?.pins ?? [];
 	}
 
+	/**
+	 * Wait for one app version's server build to finish — deploying returns
+	 * at once with `buildStatus: 'queued'`, and publish/submit/serve all
+	 * gate on a finished ('ok') build. Polls the version rail.
+	 *
+	 * @param appId - App id
+	 * @param registryVersion - Registry version number from the rail
+	 * @param options.timeoutMs - Give up after this long (default 10 minutes)
+	 * @param options.intervalMs - Poll interval (default 3 seconds)
+	 * @param options.onStatus - Called whenever the build status changes
+	 * @returns The version's rail entry once its build is 'ok'
+	 * @throws Error when the build failed, the version is unknown, or the wait timed out
+	 */
+	async waitForAppBuild(appId: string, registryVersion: number, options: { timeoutMs?: number; intervalMs?: number; onStatus?: (status: string) => void } = {}): Promise<Awaited<ReturnType<RocketRideClient['listDeployments']>>[number]> {
+		const deadline = Date.now() + (options.timeoutMs ?? 10 * 60 * 1000);
+		let lastStatus = '';
+		for (;;) {
+			const row = (await this.listDeployments(appId)).find((r) => r.registryVersion === registryVersion);
+			if (!row) throw new Error(`Version ${registryVersion} of ${appId} not found`);
+			if (row.buildStatus !== lastStatus) {
+				lastStatus = row.buildStatus;
+				options.onStatus?.(lastStatus);
+			}
+			if (row.buildStatus === 'ok') return row;
+			if (row.buildStatus === 'failed' || row.state === 'failed') {
+				throw new Error(`Version ${registryVersion} of ${appId} failed its server build — read it with buildLog(appId, ${registryVersion})`);
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(`Timed out waiting for version ${registryVersion} of ${appId} to build (status '${row.buildStatus || 'unknown'}')`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 3000));
+		}
+	}
+
+	/**
+	 * The caller org's developer namespace — the `<developerId>` half of
+	 * every app id it owns. Readable on both editions (OSS answers the
+	 * fixed namespace its sessions carry; there is no Stripe Connect there).
+	 *
+	 * @returns `{developerId, stripeAccountId, stripeAccountStatus}`;
+	 *   `developerId` is null until an org admin registers one
+	 */
+	async developerStatus(): Promise<{ developerId: string | null; stripeAccountId: string | null; stripeAccountStatus: string }> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'developer_status' })) as any;
+	}
+
+	/**
+	 * Claim the caller org's developer id slug (org.admin, self-service,
+	 * SaaS only). Apps are then created as `<developerId>.<name>` and can
+	 * publish beyond the workspace.
+	 *
+	 * @param developerId - The slug to claim (lowercase letters/underscores)
+	 * @returns The server's registration record
+	 */
+	async registerDeveloper(developerId: string): Promise<Record<string, unknown>> {
+		return (await this.call('rrext_deploy_app', { subcommand: 'developer_register', developerId })) as any;
+	}
+
 	// (appEntry is RETIRED: versions serve from stable constructed URLs —
 	// /apps/<appId>/v<N>/remoteEntry.js — with entitlement enforced per
 	// request by the serve route, so there is nothing to mint.)
@@ -3109,15 +3167,33 @@ export class RocketRideClient extends DAPClient {
 	 * @param target   - Task token if querying a pipeline, or undefined for server.
 	 * @param maxDepth - Maximum tree depth (default 50).
 	 * @param minPct   - Minimum cumtime percentage threshold (default 0.1).
-	 * @returns Object containing the tree root, total_time, and total_calls.
+	 * @param includeSystem - Keep stdlib/system functions in the tree (server default true).
+	 * @param thread   - Thread id from cprofileThreads() for that thread alone;
+	 *                   all threads merged when omitted.
+	 * @returns Object containing the tree root, functions (exact per-function
+	 *          totals; absent from older servers), total_time, and total_calls.
 	 */
-	async cprofileReportTree(target?: string | null, maxDepth?: number, minPct?: number, includeSystem?: boolean): Promise<CProfileReportTreeResponse> {
+	async cprofileReportTree(target?: string | null, maxDepth?: number, minPct?: number, includeSystem?: boolean, thread?: number | null): Promise<CProfileReportTreeResponse> {
 		const args: Record<string, unknown> = {};
 		if (target) args.target = target;
 		if (maxDepth !== undefined) args.max_depth = maxDepth;
 		if (minPct !== undefined) args.min_pct = minPct;
 		if (includeSystem !== undefined) args.include_system = includeSystem;
+		// 0 is a real thread id, so test for absence rather than truthiness
+		if (thread !== undefined && thread !== null) args.thread = thread;
 		return this.call<CProfileReportTreeResponse>('rrext_cprofile_report_tree', args);
+	}
+
+	/**
+	 * List the threads profiled in the last completed session.
+	 *
+	 * @param target - Task token if querying a pipeline, or undefined for server.
+	 * @returns Object containing the threads, busiest first.
+	 */
+	async cprofileThreads(target?: string | null): Promise<CProfileThreadsResponse> {
+		const args: Record<string, unknown> = {};
+		if (target) args.target = target;
+		return this.call<CProfileThreadsResponse>('rrext_cprofile_threads', args);
 	}
 
 	// ============================================================================

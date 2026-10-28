@@ -48,9 +48,19 @@ void setProcessCommandLineResults(Error &ccode) noexcept;
 
 //-------------------------------------------------------------------------
 /// @details
+///		Intern a file or function name for an ap::Location built from
+///		Python. Location holds string_views, so the text must live for
+///		the process; the returned view is permanently valid. One pool
+///		for the whole engine (see init.cpp for why it is leaked).
+//-------------------------------------------------------------------------
+std::string_view internLocationText(std::string text);
+
+//-------------------------------------------------------------------------
+/// @details
 ///		External declarations for starting/stopping the python engine
 //-------------------------------------------------------------------------
 void setupDebug() noexcept;
+void setupProfiler() noexcept;
 bool isPython() noexcept;
 Error init() noexcept;
 Error execPython() noexcept;

@@ -23,6 +23,10 @@
 
 #include <engLib/eng.h>
 #include <filesystem>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 #ifdef _WIN32
 #include <fcntl.h>  // for _O_RDONLY
 #include <io.h>     // for _dup, _dup2, _open, _close, _fileno
@@ -275,12 +279,18 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 // This is used by the GIL locking mechanism
-thread_local bool tls_thread_state_ref;
+bool &threadStateRef() noexcept {
+    thread_local bool ref = false;
+    return ref;
+}
 
 // These are debugger support variables
 thread_local bool tls_debug_attached = false;
 thread_local int tls_debug_processed = 0;
 thread_local bool tls_thread_named = false;
+
+// Guards one-time profiler registration per thread
+thread_local bool tls_profiler_checked = false;
 
 //---------------------------------------------------------------------
 /// @details
@@ -347,32 +357,110 @@ void setupDebug() noexcept {
         }
     }
 
-    // If we have not named the thread for python yet, we will do so now.
-    if (!tls_thread_named) {
-        try {
-            // Get the name of this thread
-            std::string name = std::string(ap::async::getCurrentThreadName());
+    // Give the thread one name on both sides, if not done yet
+    syncThreadName();
+}
 
-            // Output a message
-            LOG(Python, "Updating thread name to", name);
+//---------------------------------------------------------------------
+/// @details
+///		Gives the calling thread one name in the engine and in Python,
+///		once per thread.  Whoever started the thread named it: the
+///		engine its own threads, Python its own (asyncio_0 and the like).
+///		Each side knows a thread it did not start only by a placeholder,
+///		the engine by ThreadApi::ExternalName and Python by a
+///		_DummyThread's "Dummy-N", and takes the other side's name.
+///
+///		Called when the engine calls into Python (setupDebug) and when
+///		Python calls into the engine (UnlockPython), so the name is
+///		settled before either side logs or profiles the thread.  This
+///		MUST be called while the GIL is locked
+///--------------------------------------------------------------------
+void syncThreadName() noexcept {
+    // Only attempt this once per thread
+    if (tls_thread_named)
+        return;
+    tls_thread_named = true;
 
-            // Get the threading module
-            py::module threading = py::module::import("threading");
+    try {
+        // Get the callers thread in python
+        py::module threading = py::module::import("threading");
+        py::object currentThread = threading.attr("current_thread")();
 
-            // Get the callers thread in python
-            py::object currentThread = threading.attr("current_thread")();
+        // Python started this thread and named it: the engine takes that
+        // name, unless it has a real one of its own (the main thread)
+        if (!py::isinstance(currentThread, threading.attr("_DummyThread"))) {
+            std::string name =
+                py::cast<std::string>(currentThread.attr("name"));
 
-            // Set the name
-            currentThread.attr("name") = name;
-        } catch (const py::error_already_set &e) {
-            LOG(Python, "Python error during debug set thread name {}",
-                e.what());
-        } catch (...) {
-            LOG(Python, "Error setting up thread name");
+            // A context made now is born with the name; one made earlier
+            // holds only the placeholder
+            auto ctx = ap::async::ThreadApi::thisCtx(name);
+            if (ctx->name() == ap::async::ThreadApi::ExternalName)
+                ctx->setName(ap::TextView{name});
+
+            if (ctx->name() == ap::TextView{name}) {
+                LOG(Python, "Engine thread name taken from Python:", name);
+                return;
+            }
         }
 
-        // Only attempt this once
-        tls_thread_named = true;
+        // Python knows this thread only as Dummy-N: it takes the engine's
+        std::string name = std::string(ap::async::getCurrentThreadName());
+        LOG(Python, "Updating thread name to", name);
+        currentThread.attr("name") = name;
+    } catch (const py::error_already_set &e) {
+        LOG(Python, "Python error during set thread name {}", e.what());
+    } catch (...) {
+        LOG(Python, "Error setting up thread name");
+    }
+}
+
+//---------------------------------------------------------------------
+/// @details
+///		Registers the calling thread with the Python profiler if a
+///		profiling session is active. yappi hooks a thread either at
+///		start(), which sweeps the thread states existing at that moment,
+///		or through threading.Thread's bootstrap; a worker thread whose
+///		PyThreadState is created mid-session matches neither, so
+///		everything it runs would be invisible.
+///
+///		Once per thread is sufficient ONLY because LockPython's
+///		unbalanced inc_ref() pins the thread state for the process
+///		lifetime -- see lock.hpp:42-45. A thread that finds no session
+///		is swept up by any later start().
+///
+///		The guard is set once an attempt was made; the paths that skip
+///		the attempt leave it unset so a later call retries.
+///
+///		This MUST be called while the GIL is locked, and AFTER
+///		setupDebug(): that names the thread in threading._active, which
+///		is where yappi resolves context names from.
+///--------------------------------------------------------------------
+void setupProfiler() noexcept {
+    // Only ever attempt this once per thread
+    if (tls_profiler_checked)
+        return;
+
+    try {
+        // If the manager was never imported no session can exist, and
+        // checking sys.modules avoids triggering an import here
+        auto sys_modules = py::module_::import("sys").attr("modules");
+        if (!sys_modules.contains("ai.common.cprofile_manager"))
+            return;
+
+        // Register with the active session; a no-op when none is running
+        auto mgr = py::module_::import("ai.common.cprofile_manager");
+        mgr.attr("profiler").attr("register_current_thread")();
+
+        // On the attempt, not on the returned bool: false only means "no
+        // session", and this thread is pinned, so start() will sweep it up.
+        // Gating on it would take the manager lock on every call from here on
+        tls_profiler_checked = true;
+    } catch (const py::error_already_set &e) {
+        LOG(Python, "Python error during profiler registration {}", e.what());
+    } catch (...) {
+        // Profiling support must never break an engine->Python call
+        LOG(Python, "Error registering thread with the profiler");
     }
 }
 
@@ -629,5 +717,34 @@ Error executePythonArguments(py::object &argv) {
     // Log the final output in Python (after re-acquiring the GIL)
     LOG(Python, "Python completed command line processing with", ccode);
     return ccode;
+}
+
+//-------------------------------------------------------------------------
+/// @details
+///		The names are interned for the life of the process, and the views
+///		handed out point into that pool. ap::Location holds string_views and
+///		Error keeps a Location by value, so a location built over a
+///		caller-local (or later overwritten) std::string outlives its own
+///		storage - every later read of it, such as the completionError
+///		property, then lands in freed memory. A pipeline's distinct
+///		file/function names are bounded by its Python sources, so the pool
+///		stays small; it is never pruned, which is what makes the views
+///		permanently safe. unordered_set is node-based, so inserting never
+///		moves an element another view already points at.
+///
+///		The pool and its lock are leaked on purpose rather than left as
+///		ordinary function-local statics. Those are destroyed in reverse
+///		order of construction, and engine::config::monitor()
+///		(config/global.hpp) is constructed first - so the pool would be gone
+///		while the monitor still holds Errors viewing into it, putting the
+///		same dangling read back at shutdown. Leaking is what makes "life of
+///		the process" exact; the memory is reclaimed by the OS when the
+///		process ends.
+//-------------------------------------------------------------------------
+std::string_view internLocationText(std::string text) {
+    static auto &internLock = *new std::mutex();
+    static auto &internPool = *new std::unordered_set<std::string>();
+    const std::lock_guard<std::mutex> guard(internLock);
+    return *internPool.insert(std::move(text)).first;
 }
 }  // namespace engine::python

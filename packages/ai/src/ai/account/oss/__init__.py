@@ -65,6 +65,11 @@ class Account(AccountBase):
 
     capabilities = ('oss',)
 
+    # No review ladder on a single-operator server: the developer IS the
+    # admin, so @public publishes directly (app_deploy skips the 'ready'
+    # gate; the 'failed'/built gates still apply).
+    review_ladder = False
+
     # =========================================================================
     # AUTH
     # =========================================================================
@@ -122,10 +127,12 @@ class Account(AccountBase):
                 'name': 'Local',
                 # Standalone publishes under the shared platform namespace:
                 # anyone running the OSS server can deploy modified
-                # rocketride.* apps to their own server's rungs (@me/@team) —
-                # upstreaming a change to the common apps happens via PR, and
-                # the @public rung stays unreachable without the SaaS review
-                # ladder, so the namespace grant never leaves this install.
+                # rocketride.* apps to any of their own server's rungs —
+                # including @public, which publishes directly here
+                # (review_ladder=False above; no review on a
+                # single-operator server). Upstreaming a change to the
+                # common apps still happens via PR, and every rung is local
+                # to this install, so the namespace grant never leaves it.
                 'developerId': 'rocketride',
                 'permissions': ['org.admin'],
                 'teams': [
@@ -344,7 +351,7 @@ class Account(AccountBase):
     # audit() is inherited from AccountBase as a no-op — OSS has no database.
 
     # resolve_db_dsn is inherited from AccountBase: env-gated broker call
-    # (ROCKETRIDE_DB_BROKER_URL/_TOKEN); raises the cloud-sign-in error when
+    # (ROCKETRIDE_DB_BROKER_URL/_TOKEN); raises NotImplementedError when
     # the environment is not configured — the open-source default.
 
     # =========================================================================
