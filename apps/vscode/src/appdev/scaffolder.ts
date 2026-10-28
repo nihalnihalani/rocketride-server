@@ -4,15 +4,16 @@
 // =============================================================================
 
 /**
- * App scaffolder — the non-interactive engine behind `rocketride.app.create`.
+ * App scaffolder — the VS Code host of `rocketride.app.create`.
  *
  * The New App wizard (NewAppProvider webview) collects the app-name slug,
  * display name, and frame options, assembles the app id from the resolved
  * developer id, and calls scaffoldApp(). Scaffolding validates at submit
- * time (the wizard panel is modeless — its form state may be stale), writes
- * the template tree (every file with the MIT header), then opens the App
- * Builder screen. The scaffold always ends BOUND: the appManifest.id in the
- * generated package.json is what MY APPS discovers (bind, don't sync).
+ * time (the wizard panel is modeless — its form state may be stale), then
+ * runs the SDK's one scaffold (`createAppWorkspace` — the same code behind
+ * `rocketride app create`), and opens the App Builder screen. The scaffold
+ * always ends BOUND: the appManifest.id in the generated package.json is
+ * what MY APPS discovers (bind, don't sync).
  *
  * Dependencies install through the workspace-global model: the root
  * workspace file claims apps/*, so scaffolding triggers the shared
@@ -23,12 +24,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { createAppWorkspace } from 'rocketride/app-pack';
 import { ConnectionManager } from '../connection/connection';
 import { getLogger } from '../shared/util/output';
-import { renderTemplate } from 'shared/modules/appdev/templates';
 import type { FrameOptions, TemplateName } from 'shared/modules/appdev/templates';
 import { getExtensionContext } from '../extension';
-import { ensureAppTrigger, ensureProjectId } from './appMarker';
 import { vendorAppTypes } from './appTypes';
 import { getWatchManager } from './watchManager';
 
@@ -84,44 +84,6 @@ export async function listAppFolders(): Promise<string[]> {
 }
 
 // =============================================================================
-// GITIGNORE
-// =============================================================================
-
-/**
- * Ensures the WORKSPACE root's .gitignore covers dependency trees and build
- * output — the root install materializes node_modules at the root and in
- * every app, and app builds emit dist/, none of which belong in the user's
- * repository.
- *
- * Conservative with the user-owned file: a missing file is created; an
- * existing file only gains the patterns it does not already carry (checked
- * against the common spellings), appended at the end with a comment.
- *
- * @param workspaceRoot - The workspace folder owning .gitignore.
- */
-function ensureGitignore(workspaceRoot: string): void {
-	const logger = getLogger();
-	const ignorePath = path.join(workspaceRoot, '.gitignore');
-	// step: pattern → accepted existing spellings (any of these means covered)
-	const wanted: Array<{ line: string; spellings: string[] }> = [
-		{ line: '**/node_modules/', spellings: ['node_modules', 'node_modules/', '**/node_modules', '**/node_modules/'] },
-		{ line: '**/dist/', spellings: ['dist', 'dist/', '**/dist', '**/dist/'] },
-	];
-	try {
-		const existing = fs.existsSync(ignorePath) ? fs.readFileSync(ignorePath, 'utf8') : '';
-		const lines = new Set(existing.split(/\r?\n/).map((l) => l.trim()));
-		const missing = wanted.filter((w) => !w.spellings.some((s) => lines.has(s)));
-		if (missing.length === 0) return;
-		// step: append only what is missing, under one explanatory comment
-		const block = `${existing && !existing.endsWith('\n') ? '\n' : ''}${existing ? '\n' : ''}# Dependencies and build output (machine-generated)\n${missing.map((w) => w.line).join('\n')}\n`;
-		fs.writeFileSync(ignorePath, existing + block);
-		logger.output(`[appdev] ${existing ? 'amended' : 'wrote'} ${ignorePath} — added ${missing.map((w) => w.line).join(', ')}`);
-	} catch (err) {
-		logger.output(`[appdev] could not update ${ignorePath} (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
-	}
-}
-
-// =============================================================================
 // WORKSPACE SETTINGS
 // =============================================================================
 
@@ -152,76 +114,16 @@ function ensureWorkspaceSettings(workspaceRoot: string): void {
 }
 
 // =============================================================================
-// LAUNCH CONFIG
-// =============================================================================
-
-/**
- * Merges the app's F5 debug configuration into the WORKSPACE root's
- * .vscode/launch.json — one entry per app, keyed by name ("Debug <app>").
- *
- * Conservative with the user-owned file: a missing file is created whole; a
- * parseable file gains (or updates) only this app's entry; an unparseable
- * file (launch.json allows comments, which JSON.parse rejects) is left
- * untouched with a log naming the config to add by hand. Non-fatal — a
- * debug config is never a reason to fail a scaffold.
- *
- * @param workspaceRoot - The workspace folder owning .vscode/.
- * @param appName - Display name (the config is "Debug <appName>").
- * @param appRelFolder - App folder relative to the root (webRoot target).
- * @param previewUrl - The preview shell URL the debugger opens.
- */
-function ensureLaunchConfig(workspaceRoot: string, appName: string, appRelFolder: string, previewUrl: string): void {
-	const logger = getLogger();
-	const launchDir = path.join(workspaceRoot, '.vscode');
-	const launchPath = path.join(launchDir, 'launch.json');
-	// step: the entry — msedge against the preview shell, sources mapped
-	// into the app's folder
-	const config = {
-		name: `Debug ${appName}`,
-		type: 'msedge',
-		request: 'launch',
-		url: previewUrl,
-		webRoot: `\${workspaceFolder}/${appRelFolder}`,
-		sourceMapPathOverrides: {
-			'webpack:///./*': `\${workspaceFolder}/${appRelFolder}/*`,
-			'webpack:///*': '*',
-		},
-	};
-	try {
-		if (!fs.existsSync(launchPath)) {
-			// step: no file — create the standard skeleton with this entry
-			fs.mkdirSync(launchDir, { recursive: true });
-			fs.writeFileSync(launchPath, `${JSON.stringify({ version: '0.2.0', configurations: [config] }, null, 2)}\n`);
-			logger.output(`[appdev] wrote ${launchPath} with "${config.name}"`);
-			return;
-		}
-		// step: merge into the existing file — replace this app's entry by
-		// name, keep everything else byte-for-byte semantically intact
-		const parsed = JSON.parse(fs.readFileSync(launchPath, 'utf8'));
-		const configurations: Record<string, unknown>[] = Array.isArray(parsed.configurations) ? parsed.configurations : [];
-		const idx = configurations.findIndex((c) => c && c.name === config.name);
-		if (idx >= 0) configurations[idx] = config;
-		else configurations.push(config);
-		parsed.configurations = configurations;
-		fs.writeFileSync(launchPath, `${JSON.stringify(parsed, null, 2)}\n`);
-		logger.output(`[appdev] ${idx >= 0 ? 'updated' : 'added'} "${config.name}" in ${launchPath}`);
-	} catch (err) {
-		// launch.json permits comments/trailing commas; never mangle a file
-		// this code cannot faithfully rewrite.
-		logger.output(`[appdev] could not merge the debug config into ${launchPath} (${err instanceof Error ? err.message : String(err)}) — add a "${config.name}" msedge configuration for ${previewUrl} manually`);
-	}
-}
-
-// =============================================================================
 // SCAFFOLD
 // =============================================================================
 
 /**
  * Scaffolds a new app into the workspace `apps/` directory.
  *
- * Re-validates the identity and target folder at submit time, writes the
- * rendered template tree, vendors the platform types, and opens the App
- * Builder with the install-step toast.
+ * Re-validates the identity at submit time, runs the SDK scaffold (folder,
+ * template tree, .rrapp trigger, projectId, workspace file, dependency
+ * wiring, .gitignore), vendors the platform types through the session
+ * memo, and opens the App Builder.
  *
  * @param params - The wizard-collected scaffold parameters.
  * @returns The created app id.
@@ -230,77 +132,45 @@ function ensureLaunchConfig(workspaceRoot: string, appName: string, appRelFolder
  */
 export async function scaffoldApp(params: ScaffoldParams): Promise<string> {
 	const { appId, appName, frame } = params;
+	const logger = getLogger();
 
 	// ── 1. Validate identity (submit-time — the form state may be stale) ─
 	if (!APP_ID_RE.test(appId)) {
-		throw new Error(`Invalid app id "${appId}" — use <publisher>.<name>; the name starts with a lowercase letter, then letters, digits, underscores, and hyphens.`);
+		throw new Error(`Invalid app id "${appId}". Use <publisher>.<name>; the name starts with a lowercase letter, then letters, digits, underscores, and hyphens.`);
 	}
 	if (!appName.trim()) {
 		throw new Error('Display name is required.');
 	}
-
-	// ── 2. Target folder ─────────────────────────────────────────────────
 	const root = vscode.workspace.workspaceFolders?.[0];
 	if (!root) {
-		throw new Error('Open a workspace folder first — the app is scaffolded into it.');
-	}
-	// Apps live under ./apps by convention — symmetric with ./pipelines
-	// (pipeline files) and the node designer's ./nodes, and it makes an
-	// existing RocketRide repo's apps editable in place.
-	const folderName = `${appId.split('.')[1]}-ui`;
-	const target = vscode.Uri.joinPath(root.uri, 'apps', folderName);
-
-	// Refuse to scaffold over an existing folder — never overwrite work
-	let folderTaken = false;
-	try {
-		await vscode.workspace.fs.stat(target);
-		folderTaken = true;
-	} catch {
-		/* good — folder is free */
-	}
-	if (folderTaken) {
-		throw new Error(`Folder "apps/${folderName}" already exists in the workspace.`);
+		throw new Error('Open a workspace folder first. The app is scaffolded into it.');
 	}
 
-	// ── 3. Render + write the tree ───────────────────────────────────────
-	// Preview URL for the F5 debug config: the current engine's shell with
-	// the app locked + dev hooks on (same derivation as the App Screen).
-	const base = (ConnectionManager.getInstance().getHttpUrl?.() || 'http://localhost:5565').replace(/\/$/, '');
-	const previewUrl = `${base}/?appid=${encodeURIComponent(appId)}&rrdev=1`;
-	const files = renderTemplate(
-		params.template ?? 'Blank',
-		{
-			appId,
-			appName,
-			// The publisher half of the id — the resolved developer id
-			publisher: appId.split('.')[0],
-			moduleId: appId.replace(/[.-]/g, '_'),
-			// Deterministic-ish dev port from the app id, clear of common ranges
-			port: 3100 + (Math.abs([...appId].reduce((a, c) => a * 31 + c.charCodeAt(0), 7)) % 800),
-			previewUrl,
-		},
-		frame,
-	);
-	for (const file of files) {
-		const uri = vscode.Uri.joinPath(target, ...file.path.split('/'));
-		await vscode.workspace.fs.writeFile(uri, Buffer.from(file.content, 'utf8'));
-	}
+	// ── 2. The one scaffold (shared with `rocketride app create`) ────────
+	// Apps live under ./apps/<slug>-ui — symmetric with ./pipelines and the
+	// node designer's ./nodes. The SDK refuses an existing folder. Its
+	// install and vendoring are left to this host: the WatchManager owns
+	// the single-flight install and ensureShell the session vendor memo.
+	const [developerId, slug] = appId.split('.');
+	const created = await createAppWorkspace(root.uri.fsPath, slug, {
+		template: params.template ?? 'Blank',
+		displayName: appName,
+		developerId,
+		sidebar: frame.sidebar,
+		statusFooter: frame.statusFooter,
+		docTabs: frame.docTabs,
+		// The connected engine's shell — the preview URL's origin
+		serverBaseUrl: ConnectionManager.getInstance().getHttpUrl?.() || undefined,
+		vendor: false,
+		install: false,
+		onProgress: (line) => logger.output(`[appdev] ${line}`),
+	});
+	const target = vscode.Uri.joinPath(root.uri, ...created.folder.split('/'));
 
-	// The .rrapp trigger + the appManifest projectId are generated AT
-	// CREATION — deploy provenance never depends on the app having been
-	// opened in the App Builder first.
-	await ensureAppTrigger(target.fsPath, appId);
-	await ensureProjectId(target.fsPath);
-
-	// F5 debug config lives in the WORKSPACE root's .vscode/launch.json —
-	// VSCode only surfaces launch configs from workspace-folder roots, so an
-	// app-local .vscode would never appear in the debug dropdown. One entry
-	// per app, merged beside whatever the user already has.
-	ensureLaunchConfig(root.uri.fsPath, appName, `apps/${folderName}`, previewUrl);
-
-	// Dependency trees and build output stay out of the user's repository —
-	// the root install and app builds generate both at multiple depths.
-	ensureGitignore(root.uri.fsPath);
+	// No launch.json entry is scaffolded: F5 debugging goes through the
+	// rocketride.app.debug command, which builds its config in-memory and
+	// ensures the watch session first — a static launch entry would open
+	// the preview with no dev bundle being served.
 
 	// First scaffold in a fresh workspace also seeds settings.json so the
 	// Explorer hides the gitignored machine-generated trees.

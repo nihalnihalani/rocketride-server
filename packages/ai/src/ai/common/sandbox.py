@@ -60,6 +60,8 @@ from RestrictedPython.Guards import (
     safer_getattr,
 )
 
+from hosting import is_shared_host
+
 _TIMEOUT = 20
 _MAX_OUTPUT = 51200  # 50 KB
 
@@ -216,7 +218,12 @@ def execute_sandboxed(
             'timed_out': False,
         }
 
-    allowlist = _DEFAULT_ALLOWED_MODULES | (allowed_modules or set())
+    # A task that shares the engine's host gets --shared-host (see the
+    # hosting module). There, only the default modules are allowed: an extra
+    # module (os, boto3, ...) or a package installed on demand runs with the
+    # engine container's own access, not the user's.
+    shared_host = is_shared_host()
+    allowlist = _DEFAULT_ALLOWED_MODULES | (set() if shared_host else (allowed_modules or set()))
 
     # ── 1. Build safe builtins ─────────────────────────────────────────
     # RestrictedPython's safe_builtins is very minimal — it omits common
@@ -234,7 +241,10 @@ def execute_sandboxed(
     def restricted_import(name: str, *args: Any, **kwargs: Any) -> Any:
         top_level = name.split('.')[0]
         if top_level not in allowlist:
-            raise ImportError(f"Import of '{name}' is not allowed. Allowed modules: {', '.join(sorted(allowlist))}")
+            where = ' on RocketRide Cloud' if shared_host else ''
+            raise ImportError(
+                f"Import of '{name}' is not allowed{where}. Allowed modules: {', '.join(sorted(allowlist))}"
+            )
         try:
             return original_import(name, *args, **kwargs)
         except ModuleNotFoundError:

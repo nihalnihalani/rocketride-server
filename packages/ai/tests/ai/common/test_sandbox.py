@@ -203,3 +203,37 @@ result = total
     assert out['timed_out'] is True
     assert out['exit_code'] == -1
     assert '1s' in out['stderr']
+
+
+# ---------------------------------------------------------------------------
+# On the engine's host (--shared-host): default modules only, never an install
+# ---------------------------------------------------------------------------
+
+
+def test_shared_host_ignores_extra_modules(monkeypatch):
+    import ai.common.sandbox as sandbox
+
+    installs = []
+    monkeypatch.setattr(sandbox, '_pip_install', lambda pkg: installs.append(pkg))
+    monkeypatch.setattr(sandbox.sys, 'argv', [*sandbox.sys.argv, '--shared-host'])
+
+    blocked = execute_sandboxed('import os\nresult = os.name', allowed_modules={'os'})
+    assert blocked['exit_code'] != 0
+    assert 'not allowed on RocketRide Cloud' in str(blocked)
+
+    missing = execute_sandboxed('import some_uninstalled_pkg_xyz', allowed_modules={'some_uninstalled_pkg_xyz'})
+    assert missing['exit_code'] != 0
+    assert installs == []
+
+    fine = execute_sandboxed('import math\nresult = math.floor(2.5)', allowed_modules={'os'})
+    assert fine['exit_code'] == 0
+
+
+def test_hosted_alone_keeps_extra_modules(monkeypatch):
+    import ai.common.sandbox as sandbox
+
+    argv = [a for a in sandbox.sys.argv if a != '--shared-host']
+    monkeypatch.setattr(sandbox.sys, 'argv', [*argv, '--hosted'])
+
+    allowed = execute_sandboxed('import os\nresult = os.name', allowed_modules={'os'})
+    assert allowed['exit_code'] == 0
